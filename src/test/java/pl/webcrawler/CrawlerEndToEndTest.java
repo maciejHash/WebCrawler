@@ -150,7 +150,7 @@ class CrawlerEndToEndTest {
     void crawlsWholeSiteOnceAndRecordsEveryLink() {
         String dbPath = tempDir.resolve("crawl.db").toString();
         CrawlerConfig config = new CrawlerConfig(base + "/", THREADS, 100, 10, true,
-                dbPath, 2_000, 0, "test-agent");
+                dbPath, false, 2_000, 0, "test-agent");
 
         Crawler.Stats stats = new Crawler(config).run();
 

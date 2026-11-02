@@ -3,12 +3,14 @@ package pl.webcrawler;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.junit.jupiter.api.Assertions.fail;
 
 import java.io.IOException;
 import java.io.OutputStream;
 import java.net.InetSocketAddress;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
+import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.TreeSet;
@@ -46,6 +48,9 @@ class CrawlerTest {
     private String base;
     /** Ścieżka → liczba żądań; najważniejsza asercja: każda wartość równa 1. */
     private final Map<String, AtomicInteger> requests = new ConcurrentHashMap<>();
+    private final AtomicInteger totalRequests = new AtomicInteger();
+    /** Jeśli ustawiony, serwer woła na nim requestStop() przy trzecim żądaniu - jak Ctrl+C w trakcie pracy. */
+    private volatile Crawler stopOnThirdRequest;
 
     @BeforeEach
     void setUp() throws IOException {
@@ -72,6 +77,10 @@ class CrawlerTest {
     private void handle(HttpExchange exchange) throws IOException {
         String path = exchange.getRequestURI().getPath();
         requests.computeIfAbsent(path, p -> new AtomicInteger()).incrementAndGet();
+        Crawler toStop = stopOnThirdRequest;
+        if (totalRequests.incrementAndGet() == 3 && toStop != null) {
+            toStop.requestStop();
+        }
         StringBuilder html = new StringBuilder("<html><body>");
         for (int k = 0; k < PAGES; k++) {
             if (path(k).equals(path)) {
@@ -99,8 +108,12 @@ class CrawlerTest {
     }
 
     private CrawlerConfig config(int maxPages) {
+        return config(maxPages, false);
+    }
+
+    private CrawlerConfig config(int maxPages, boolean fresh) {
         return new CrawlerConfig(base + "/", THREADS, maxPages, 20, true,
-                tempDir.resolve("crawl.db").toString(), 2_000, 0, "test-agent");
+                tempDir.resolve("crawl.db").toString(), fresh, 2_000, 0, "test-agent");
     }
 
     /** Osobne połączenie do sprawdzenia bazy - Crawler zamyka swoje po zakończeniu. */
@@ -135,6 +148,17 @@ class CrawlerTest {
             workers.add(claimedBy);
         }
         System.out.println("Strony odwiedziły wątki: " + workers);
+
+        // Dane do raportu.
+        assertFalse(stats.stopped());
+        assertEquals(workers, stats.pagesByWorker().keySet());
+        assertEquals(PAGES, stats.pagesByWorker().values().stream().mapToInt(Integer::intValue).sum(),
+                "każda pobrana strona przypisana do dokładnie jednego wątku: " + stats.pagesByWorker());
+        List<DBConn.LinkRow> mostSeen = stats.mostSeen();
+        assertEquals(Crawler.MOST_SEEN_LIMIT, mostSeen.size());
+        for (int i = 1; i < mostSeen.size(); i++) {
+            assertTrue(mostSeen.get(i - 1).seen() >= mostSeen.get(i).seen(), "malejąco po seen: " + mostSeen);
+        }
     }
 
     @Test
@@ -159,5 +183,56 @@ class CrawlerTest {
         assertEquals(Map.of("VISITED", PAGES), second.countByStatus());
         assertEquals(1, row(0).seen(), "addSeed nie może zwiększać seen adresu startowego");
         assertEquals(0, row(0).depth());
+    }
+
+    @Test
+    void freshRunDropsPreviousDataAndStartsOver() {
+        new Crawler(config(3)).run();
+        Crawler.Stats second = new Crawler(config(100, true)).run();
+
+        // Po --fresh baza jest pusta, więc wszystkie strony są pobierane od nowa.
+        assertEquals(PAGES, second.pagesFetched());
+        assertEquals(3 + PAGES, totalRequests.get());
+        assertEquals(Map.of("VISITED", PAGES), second.countByStatus());
+        // seen liczone od zera - gdyby stare wiersze zostały, byłoby większe.
+        assertEquals(1, row(0).seen());
+        assertEquals(PAGES, second.pagesByWorker().values().stream().mapToInt(Integer::intValue).sum());
+    }
+
+    @Test
+    void requestStopFinishesCurrentPagesAndResumeCompletesTheRest() {
+        Crawler first = new Crawler(config(100));
+        stopOnThirdRequest = first;
+        Crawler.Stats stopped = first.run();
+        stopOnThirdRequest = null;
+
+        assertTrue(stopped.stopped());
+        // Po trzecim żądaniu dokończone są tylko strony już przejęte (najwyżej po jednej na wątek).
+        assertTrue(stopped.pagesFetched() >= 3 && stopped.pagesFetched() < PAGES,
+                "pobrano: " + stopped.pagesFetched());
+        // Łagodne zatrzymanie: żadna strona nie została porzucona w połowie.
+        assertFalse(stopped.countByStatus().containsKey("IN_PROGRESS"), stopped.countByStatus().toString());
+        assertEquals(stopped.pagesFetched(), (int) stopped.countByStatus().get("VISITED"));
+
+        Crawler.Stats resumed = new Crawler(config(100)).run();
+
+        assertFalse(resumed.stopped());
+        assertEquals(PAGES - stopped.pagesFetched(), resumed.pagesFetched());
+        assertEachPageRequestedOnce();
+        assertEquals(Map.of("VISITED", PAGES), resumed.countByStatus());
+    }
+
+    @Test
+    void stopBeforeStartFetchesNothing() {
+        Crawler crawler = new Crawler(config(100));
+        crawler.requestStop();
+
+        Crawler.Stats stats = crawler.run();
+
+        if (totalRequests.get() != 0) {
+            fail("po requestStop nie wolno pobierać stron, pobrano: " + requests.keySet());
+        }
+        assertTrue(stats.stopped());
+        assertEquals(Map.of("NEW", 1), stats.countByStatus(), "adres startowy czeka na wznowienie");
     }
 }

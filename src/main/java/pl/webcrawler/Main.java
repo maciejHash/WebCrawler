@@ -1,12 +1,15 @@
 package pl.webcrawler;
 
 import java.util.HashSet;
+import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
 
 /**
  * Punkt wejścia programu: czyta argumenty wiersza poleceń, uruchamia {@link Crawler}
- * i wypisuje podsumowanie. Argumenty parsujemy ręcznie - jest ich kilka, więc
+ * i wypisuje raport. Argumenty parsujemy ręcznie - jest ich kilka, więc
  * biblioteka do tego byłaby zbędną zależnością.
  */
 public class Main {
@@ -16,8 +19,14 @@ public class Main {
     /** Kod wyjścia przy błędzie bazy danych. */
     static final int EXIT_ERROR = 1;
 
+    /** Zapas ponad timeout i przerwę, który shutdown hook daje wątkom na zapis do bazy. */
+    static final long SHUTDOWN_MARGIN_MS = 5_000;
+
+    /** Kolejność statusów w raporcie - taka, jak przechodzi przez nie link. */
+    static final List<String> STATUSES = List.of("NEW", "IN_PROGRESS", "VISITED", "ERROR", "SKIPPED");
+
     private static final Set<String> OPTIONS_WITH_VALUE =
-            Set.of("--threads", "--max-pages", "--max-depth", "--db");
+            Set.of("--threads", "--max-pages", "--max-depth", "--db", "--delay");
 
     /** Wydzielone z main, żeby test mógł sprawdzić treść bez przechwytywania System.out. */
     static String startMessage() {
@@ -26,20 +35,30 @@ public class Main {
 
     static String usage() {
         return """
-                Użycie: webcrawler <startUrl> [opcje]
+                Użycie: java -jar web-crawler.jar <startUrl> [opcje]
 
                   <startUrl>        adres strony startowej (http lub https)
                   --threads N       liczba wątków (domyślnie %d)
-                  --max-pages N     wspólny limit pobranych stron (domyślnie %d)
+                  --max-pages N     wspólny limit stron pobranych w tym uruchomieniu (domyślnie %d)
                   --max-depth N     maksymalna głębokość, strona startowa ma 0 (domyślnie %d)
+                  --delay MS        przerwa po każdym żądaniu w milisekundach, żeby nie
+                                    przeciążać serwera (domyślnie %d, 0 = bez przerwy)
                   --all-hosts       odwiedzaj też inne hosty (domyślnie tylko host startowy)
                   --db plik         plik bazy SQLite (domyślnie %s)
+                  --fresh           usuń dane z bazy i zacznij od nowa
                   -h, --help        wyświetl tę pomoc
 
-                Przykład:
-                  mvn -q exec:java -Dexec.args="https://books.toscrape.com --threads 4 --max-pages 50"
+                Wznawianie: bez --fresh robot kontynuuje pracę zapisaną w bazie - strony
+                już odwiedzone nie są pobierane ponownie, a linki przerwane w trakcie
+                wracają do kolejki. Ctrl+C zatrzymuje robota łagodnie: wątki kończą
+                bieżące strony, wypisywany jest raport, a reszta czeka na następne uruchomienie.
+
+                Przykłady:
+                  java -jar target/web-crawler.jar https://books.toscrape.com --threads 4 --max-pages 50
+                  java -jar target/web-crawler.jar https://books.toscrape.com --fresh --delay 1000
                 """.formatted(CrawlerConfig.DEFAULT_THREADS, CrawlerConfig.DEFAULT_MAX_PAGES,
-                CrawlerConfig.DEFAULT_MAX_DEPTH, CrawlerConfig.DEFAULT_DB_PATH);
+                CrawlerConfig.DEFAULT_MAX_DEPTH, CrawlerConfig.DEFAULT_DELAY_MS,
+                CrawlerConfig.DEFAULT_DB_PATH);
     }
 
     /** --help ma pierwszeństwo przed walidacją: pomoc ma działać nawet przy błędnych argumentach. */
@@ -54,7 +73,7 @@ public class Main {
 
     /**
      * Zamienia argumenty na konfigurację. Pola, których nie da się ustawić z wiersza
-     * poleceń (timeout, przerwa, User-Agent), dostają wartości domyślne.
+     * poleceń (timeout, User-Agent), dostają wartości domyślne.
      *
      * @throws IllegalArgumentException z komunikatem do pokazania użytkownikowi
      */
@@ -63,7 +82,9 @@ public class Main {
         int threads = CrawlerConfig.DEFAULT_THREADS;
         int maxPages = CrawlerConfig.DEFAULT_MAX_PAGES;
         int maxDepth = CrawlerConfig.DEFAULT_MAX_DEPTH;
+        int delayMs = CrawlerConfig.DEFAULT_DELAY_MS;
         boolean sameHostOnly = CrawlerConfig.DEFAULT_SAME_HOST_ONLY;
+        boolean fresh = CrawlerConfig.DEFAULT_FRESH;
         String dbPath = CrawlerConfig.DEFAULT_DB_PATH;
 
         Set<String> usedOptions = new HashSet<>();
@@ -81,8 +102,13 @@ public class Main {
             if (!usedOptions.add(arg)) {
                 throw new IllegalArgumentException("Opcja " + arg + " podana więcej niż raz");
             }
+            // Opcje bez wartości (przełączniki).
             if (arg.equals("--all-hosts")) {
                 sameHostOnly = false;
+                continue;
+            }
+            if (arg.equals("--fresh")) {
+                fresh = true;
                 continue;
             }
             if (!OPTIONS_WITH_VALUE.contains(arg)) {
@@ -94,6 +120,7 @@ public class Main {
                 case "--threads" -> threads = intValue(arg, value, 1);
                 case "--max-pages" -> maxPages = intValue(arg, value, 1);
                 case "--max-depth" -> maxDepth = intValue(arg, value, 0);
+                case "--delay" -> delayMs = intValue(arg, value, 0);
                 case "--db" -> dbPath = value;
             }
         }
@@ -101,9 +128,8 @@ public class Main {
             throw new IllegalArgumentException("Brak adresu startowego");
         }
         // Adres sprawdza i normalizuje konstruktor CrawlerConfig.
-        return new CrawlerConfig(startUrl, threads, maxPages, maxDepth, sameHostOnly, dbPath,
-                CrawlerConfig.DEFAULT_TIMEOUT_MS, CrawlerConfig.DEFAULT_DELAY_MS,
-                CrawlerConfig.DEFAULT_USER_AGENT);
+        return new CrawlerConfig(startUrl, threads, maxPages, maxDepth, sameHostOnly, dbPath, fresh,
+                CrawlerConfig.DEFAULT_TIMEOUT_MS, delayMs, CrawlerConfig.DEFAULT_USER_AGENT);
     }
 
     /** Wartość opcji stojącej na pozycji optionIndex, czyli następny argument. */
@@ -149,26 +175,88 @@ public class Main {
 
         System.out.println(startMessage());
         System.out.println("Konfiguracja: " + config);
+
+        Crawler crawler = new Crawler(config);
+        // Odliczany dopiero po wypisaniu raportu. Shutdown hook na niego czeka, bo JVM
+        // kończy działanie zaraz po zakończeniu hooków - bez czekania raport by przepadł,
+        // a strony w trakcie pobierania zostałyby w stanie IN_PROGRESS.
+        CountDownLatch finished = new CountDownLatch(1);
+        Runtime.getRuntime().addShutdownHook(
+                new Thread(() -> onShutdown(crawler, config, finished), "shutdown-hook"));
+
+        int exitCode = 0;
         try {
-            Crawler.Stats stats = new Crawler(config).run();
-            System.out.print(summary(stats));
+            System.out.print(report(crawler.run()));
         } catch (DatabaseException e) {
             Throwable cause = e.getCause();
             System.err.println("Błąd bazy danych: " + e.getMessage()
                     + (cause != null ? " (" + cause.getMessage() + ")" : ""));
-            System.exit(EXIT_ERROR);
+            exitCode = EXIT_ERROR;
+        } finally {
+            finished.countDown();
+        }
+        // System.exit dopiero po countDown: exit uruchamia hook, a ten czekałby na
+        // wątek main, który czekałby w exit na hook - zakleszczenie.
+        if (exitCode != 0) {
+            System.exit(exitCode);
         }
     }
 
-    static String summary(Crawler.Stats stats) {
+    /**
+     * Uruchamiany przez JVM przy Ctrl+C (SIGINT), kill (SIGTERM), ale też przy zwykłym
+     * zakończeniu programu - wtedy praca jest już skończona i nie ma nic do zrobienia.
+     */
+    private static void onShutdown(Crawler crawler, CrawlerConfig config, CountDownLatch finished) {
+        if (finished.getCount() == 0) {
+            return;
+        }
+        log("zatrzymywanie - wątki kończą bieżące strony...");
+        crawler.requestStop();
+        // Najgorszy przypadek: wątek właśnie zaczął pobierać stronę (timeout), a potem
+        // odczeka przerwę (delay). Gdyby i tak nie zdążył, linki IN_PROGRESS wrócą
+        // do NEW przy następnym uruchomieniu (resetInProgress).
+        long waitMs = config.timeoutMs() + config.delayMs() + SHUTDOWN_MARGIN_MS;
+        try {
+            if (!finished.await(waitMs, TimeUnit.MILLISECONDS)) {
+                log("wątki nie zakończyły się w " + waitMs + " ms - wyjście bez raportu");
+            }
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
+    }
+
+    static String report(Crawler.Stats stats) {
         StringBuilder text = new StringBuilder();
-        text.append("\nPodsumowanie\n");
-        text.append("  pobrane strony: ").append(stats.pagesFetched()).append('\n');
-        text.append("  czas: ").append(String.format("%.1f s", stats.duration().toMillis() / 1000.0)).append('\n');
-        text.append("  linki w bazie według statusu:\n");
-        for (Map.Entry<String, Integer> entry : stats.countByStatus().entrySet()) {
+        text.append("\nRaport\n");
+        text.append(String.format("  czas trwania: %.1f s%n", stats.duration().toMillis() / 1000.0));
+        text.append("  strony pobrane w tym uruchomieniu: ").append(stats.pagesFetched()).append('\n');
+        if (stats.stopped()) {
+            text.append("  przerwano przed końcem - uruchom ponownie bez --fresh, aby kontynuować\n");
+        }
+
+        text.append("\n  Linki w bazie według statusu:\n");
+        // Wszystkie statusy, także z zerem - od razu widać, że np. nic nie zostało IN_PROGRESS.
+        for (String status : STATUSES) {
+            text.append(String.format("    %-12s %d%n", status, stats.countByStatus().getOrDefault(status, 0)));
+        }
+
+        text.append("\n  ").append(Crawler.MOST_SEEN_LIMIT).append(" najczęściej znajdowanych linków (seen):\n");
+        int position = 1;
+        for (DBConn.LinkRow row : stats.mostSeen()) {
+            text.append(String.format("    %2d. %5d  %s%n", position++, row.seen(), row.url()));
+        }
+
+        text.append("\n  Strony pobrane przez wątki (VISITED + ERROR, cała baza):\n");
+        if (stats.pagesByWorker().isEmpty()) {
+            text.append("    brak\n");
+        }
+        for (Map.Entry<String, Integer> entry : stats.pagesByWorker().entrySet()) {
             text.append(String.format("    %-12s %d%n", entry.getKey(), entry.getValue()));
         }
         return text.toString();
+    }
+
+    private static void log(String message) {
+        System.out.println("[" + Thread.currentThread().getName() + "] " + message);
     }
 }

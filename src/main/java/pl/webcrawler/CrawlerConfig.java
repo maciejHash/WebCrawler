@@ -10,19 +10,22 @@ package pl.webcrawler;
  * @param maxDepth     maksymalna głębokość; strona startowa ma głębokość 0
  * @param sameHostOnly czy odwiedzać tylko strony z hosta startowego
  * @param dbPath       ścieżka do pliku bazy SQLite
+ * @param fresh        true: usuń poprzednie dane z bazy i zacznij od nowa;
+ *                     false: wznów pracę zapisaną w bazie
  * @param timeoutMs    limit czasu jednego żądania HTTP
  * @param delayMs      przerwa po każdym żądaniu, żeby nie przeciążać serwera
  * @param userAgent    nagłówek User-Agent wysyłany z każdym żądaniem
  */
 public record CrawlerConfig(String startUrl, int threads, int maxPages, int maxDepth,
-                            boolean sameHostOnly, String dbPath, int timeoutMs, int delayMs,
-                            String userAgent) {
+                            boolean sameHostOnly, String dbPath, boolean fresh, int timeoutMs,
+                            int delayMs, String userAgent) {
 
     public static final int DEFAULT_THREADS = 4;
     public static final int DEFAULT_MAX_PAGES = 100;
     public static final int DEFAULT_MAX_DEPTH = 3;
     public static final boolean DEFAULT_SAME_HOST_ONLY = true;
     public static final String DEFAULT_DB_PATH = "crawler.db";
+    public static final boolean DEFAULT_FRESH = false;
     public static final int DEFAULT_TIMEOUT_MS = 10_000;
     public static final int DEFAULT_DELAY_MS = 500;
     // Tylko ASCII - nagłówki HTTP nie powinny zawierać innych znaków.
@@ -56,8 +59,8 @@ public record CrawlerConfig(String startUrl, int threads, int maxPages, int maxD
     /** Konfiguracja z wartościami domyślnymi dla podanego adresu startowego. */
     public static CrawlerConfig withDefaults(String startUrl) {
         return new CrawlerConfig(startUrl, DEFAULT_THREADS, DEFAULT_MAX_PAGES, DEFAULT_MAX_DEPTH,
-                DEFAULT_SAME_HOST_ONLY, DEFAULT_DB_PATH, DEFAULT_TIMEOUT_MS, DEFAULT_DELAY_MS,
-                DEFAULT_USER_AGENT);
+                DEFAULT_SAME_HOST_ONLY, DEFAULT_DB_PATH, DEFAULT_FRESH, DEFAULT_TIMEOUT_MS,
+                DEFAULT_DELAY_MS, DEFAULT_USER_AGENT);
     }
 
     private static void requireAtLeast(String name, int value, int min) {

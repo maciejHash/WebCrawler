@@ -5,6 +5,7 @@ import java.net.SocketTimeoutException;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Optional;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 
 import org.jsoup.HttpStatusException;
@@ -27,15 +28,20 @@ public class CrawlerThread implements Runnable {
     private final DBConn db;
     private final CrawlerConfig config;
     private final AtomicInteger pagesFetched;
+    private final AtomicBoolean stopRequested;
 
     /**
-     * @param pagesFetched licznik wspólny dla wszystkich wątków; dzięki niemu limit
-     *                     maxPages dotyczy całego robota, a nie pojedynczego wątku
+     * @param pagesFetched  licznik wspólny dla wszystkich wątków; dzięki niemu limit
+     *                      maxPages dotyczy całego robota, a nie pojedynczego wątku
+     * @param stopRequested flaga wspólna dla wszystkich wątków; ustawiona (np. po Ctrl+C)
+     *                      oznacza: dokończ bieżącą stronę i nie bierz kolejnej
      */
-    public CrawlerThread(DBConn db, CrawlerConfig config, AtomicInteger pagesFetched) {
+    public CrawlerThread(DBConn db, CrawlerConfig config, AtomicInteger pagesFetched,
+                         AtomicBoolean stopRequested) {
         this.db = db;
         this.config = config;
         this.pagesFetched = pagesFetched;
+        this.stopRequested = stopRequested;
     }
 
     @Override
@@ -44,6 +50,13 @@ public class CrawlerThread implements Runnable {
         log("start");
         try {
             while (!Thread.currentThread().isInterrupted()) {
+                // Łagodne zatrzymanie: flagę sprawdzamy tylko tutaj, między stronami, więc
+                // żadna strona nie zostaje przerwana w połowie. Linki NEW czekają w bazie
+                // na następne uruchomienie.
+                if (stopRequested.get()) {
+                    log("zatrzymano na żądanie");
+                    break;
+                }
                 // Limit już wyczerpany - nie ma sensu przejmować linku tylko po to, by go oddać.
                 if (pagesFetched.get() >= config.maxPages()) {
                     log("osiągnięto limit " + config.maxPages() + " stron");

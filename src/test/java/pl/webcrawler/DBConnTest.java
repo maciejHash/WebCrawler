@@ -10,6 +10,7 @@ import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import java.nio.file.Path;
+import java.util.List;
 import java.util.Map;
 
 import org.junit.jupiter.api.AfterEach;
@@ -319,6 +320,56 @@ class DBConnTest {
 
         assertEquals(Map.of("VISITED", 2, "ERROR", 1, "IN_PROGRESS", 1, "NEW", 1),
                 db.countByStatus());
+    }
+
+    @Test
+    void mostSeenIsOrderedBySeenThenByIdAndLimited() {
+        db.insertRow(URL + "once", 0);
+        db.insertRow(URL + "tie-first", 0);
+        db.insertRow(URL + "tie-second", 0);
+        db.insertRow(URL + "top", 0);
+        for (int i = 0; i < 4; i++) {
+            db.insertRow(URL + "top", 1);
+        }
+        db.insertRow(URL + "tie-first", 1);
+        db.insertRow(URL + "tie-second", 1);
+
+        List<DBConn.LinkRow> rows = db.findMostSeen(3);
+
+        assertEquals(List.of(URL + "top", URL + "tie-first", URL + "tie-second"),
+                rows.stream().map(DBConn.LinkRow::url).toList());
+        assertEquals(5, rows.get(0).seen());
+        assertEquals(2, rows.get(1).seen());
+    }
+
+    @Test
+    void mostSeenOnEmptyTableIsEmpty() {
+        assertTrue(db.findMostSeen(10).isEmpty());
+    }
+
+    @Test
+    void pagesByWorkerCountsOnlyFetchedPagesInNaturalOrder() {
+        db.markVisited(claim(URL + "a", "crawler-10"));
+        db.markVisited(claim(URL + "b", "crawler-2"));
+        db.markError(claim(URL + "c", "crawler-2"), "HTTP 404");
+        // Nie liczą się: SKIPPED (bez żądania HTTP), IN_PROGRESS (niedokończony), NEW.
+        db.markSkipped(claim(URL + "d", "crawler-2"));
+        claim(URL + "e", "crawler-3");
+        db.insertRow(URL + "f", 0);
+
+        Map<String, Integer> counts = db.countPagesByWorker();
+
+        assertEquals(Map.of("crawler-2", 2, "crawler-10", 1), counts);
+        // crawler-2 przed crawler-10, mimo że alfabetycznie byłoby odwrotnie.
+        assertEquals(List.of("crawler-2", "crawler-10"), List.copyOf(counts.keySet()));
+    }
+
+    /** Wstawia link i przejmuje go jako podany wątek; zwraca id. */
+    private long claim(String url, String worker) {
+        db.insertRow(url, 0);
+        LinkRecord link = db.claimNextLink(worker, 0).orElseThrow();
+        assertEquals(url, link.url());
+        return link.id();
     }
 
     /** Wstawia link i od razu go przejmuje (w tabeli nie może być innych linków NEW). */

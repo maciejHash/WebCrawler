@@ -6,6 +6,7 @@ import java.sql.PreparedStatement;
 import java.sql.ResultSet;
 import java.sql.SQLException;
 import java.util.ArrayList;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -52,6 +53,21 @@ public class DBConn implements AutoCloseable {
     private static final String SELECT_BY_URL = """
             SELECT id, url, depth, seen, status, claimed_by, visited_at, error
             FROM links WHERE url = ?""";
+
+    // Przy równym seen decyduje id (kolejność znalezienia) - raport jest powtarzalny.
+    private static final String SELECT_MOST_SEEN = """
+            SELECT id, url, depth, seen, status, claimed_by, visited_at, error
+            FROM links ORDER BY seen DESC, id
+            LIMIT ?""";
+
+    // Strony faktycznie pobrane (VISITED i ERROR) - SKIPPED nie wymagał żądania HTTP.
+    // claimed_by zostaje w wierszu po zakończeniu, więc wiadomo, który wątek go obsłużył.
+    // Sortowanie po długości, żeby crawler-2 było przed crawler-10.
+    private static final String COUNT_PAGES_BY_WORKER = """
+            SELECT claimed_by, COUNT(*) AS cnt FROM links
+            WHERE status IN ('VISITED', 'ERROR') AND claimed_by IS NOT NULL
+            GROUP BY claimed_by
+            ORDER BY LENGTH(claimed_by), claimed_by""";
 
     // Kandydaci do przejęcia: najstarsze (najmniejsze id) linki NEW w dozwolonej głębokości.
     // Pobieramy kilku naraz, żeby po przegranym wyścigu nie robić od razu nowego SELECT-a.
@@ -172,21 +188,44 @@ public class DBConn implements AutoCloseable {
         try (PreparedStatement stmt = openConnection().prepareStatement(SELECT_BY_URL)) {
             stmt.setString(1, url);
             try (ResultSet rs = stmt.executeQuery()) {
-                if (!rs.next()) {
-                    return Optional.empty();
-                }
-                return Optional.of(new LinkRow(
-                        rs.getLong("id"),
-                        rs.getString("url"),
-                        rs.getInt("depth"),
-                        rs.getInt("seen"),
-                        rs.getString("status"),
-                        rs.getString("claimed_by"),
-                        rs.getString("visited_at"),
-                        rs.getString("error")));
+                return rs.next() ? Optional.of(toLinkRow(rs)) : Optional.empty();
             }
         } catch (SQLException e) {
             throw new DatabaseException("Nie można odczytać linku: " + url, e);
+        }
+    }
+
+    /** Najczęściej znajdowane linki (największe seen), najwyżej limit wierszy. */
+    public synchronized List<LinkRow> findMostSeen(int limit) {
+        List<LinkRow> rows = new ArrayList<>();
+        try (PreparedStatement stmt = openConnection().prepareStatement(SELECT_MOST_SEEN)) {
+            stmt.setInt(1, limit);
+            try (ResultSet rs = stmt.executeQuery()) {
+                while (rs.next()) {
+                    rows.add(toLinkRow(rs));
+                }
+            }
+            return rows;
+        } catch (SQLException e) {
+            throw new DatabaseException("Nie można odczytać najczęściej znajdowanych linków", e);
+        }
+    }
+
+    /**
+     * Liczba stron pobranych przez każdy wątek (kolumna claimed_by), w kolejności
+     * crawler-1, crawler-2, ... Obejmuje całą bazę, także poprzednie uruchomienia.
+     */
+    public synchronized Map<String, Integer> countPagesByWorker() {
+        // LinkedHashMap zachowuje kolejność z ORDER BY.
+        Map<String, Integer> counts = new LinkedHashMap<>();
+        try (PreparedStatement stmt = openConnection().prepareStatement(COUNT_PAGES_BY_WORKER);
+             ResultSet rs = stmt.executeQuery()) {
+            while (rs.next()) {
+                counts.put(rs.getString("claimed_by"), rs.getInt("cnt"));
+            }
+            return counts;
+        } catch (SQLException e) {
+            throw new DatabaseException("Nie można policzyć stron według wątków", e);
         }
     }
 
@@ -347,6 +386,18 @@ public class DBConn implements AutoCloseable {
             stmt.setLong(2, id);
             return stmt.executeUpdate() == 1;
         }
+    }
+
+    private static LinkRow toLinkRow(ResultSet rs) throws SQLException {
+        return new LinkRow(
+                rs.getLong("id"),
+                rs.getString("url"),
+                rs.getInt("depth"),
+                rs.getInt("seen"),
+                rs.getString("status"),
+                rs.getString("claimed_by"),
+                rs.getString("visited_at"),
+                rs.getString("error"));
     }
 
     /** Wspólny kod dla UPDATE-ów, których jedynym parametrem jest id. */

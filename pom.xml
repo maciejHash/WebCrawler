@@ -29,6 +29,7 @@
     <maven-jar-plugin.version>3.5.1</maven-jar-plugin.version>
     <maven-install-plugin.version>3.2.0</maven-install-plugin.version>
     <exec-maven-plugin.version>3.6.4</exec-maven-plugin.version>
+    <maven-shade-plugin.version>3.6.2</maven-shade-plugin.version>
   </properties>
 
   <dependencies>
@@ -95,6 +96,53 @@
         <configuration>
           <mainClass>pl.webcrawler.Main</mainClass>
         </configuration>
+      </plugin>
+      <plugin>
+        <!-- Faza package: target/web-crawler.jar z naszymi klasami i wszystkimi zależnościami,
+             uruchamiany przez java -jar bez ustawiania classpath -->
+        <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-shade-plugin</artifactId>
+        <version>${maven-shade-plugin.version}</version>
+        <executions>
+          <execution>
+            <phase>package</phase>
+            <goals>
+              <goal>shade</goal>
+            </goals>
+            <configuration>
+              <outputFile>${project.build.directory}/web-crawler.jar</outputFile>
+              <!-- Bez tego shade zapisuje dependency-reduced-pom.xml w katalogu projektu -->
+              <createDependencyReducedPom>false</createDependencyReducedPom>
+              <filters>
+                <filter>
+                  <!-- Opisy modułów i podpisy zależności nie pasują do połączonego JAR-a,
+                       a manifest tworzy od nowa ManifestResourceTransformer poniżej -->
+                  <artifact>*:*</artifact>
+                  <excludes>
+                    <exclude>META-INF/MANIFEST.MF</exclude>
+                    <exclude>module-info.class</exclude>
+                    <exclude>META-INF/versions/*/module-info.class</exclude>
+                    <exclude>META-INF/*.SF</exclude>
+                    <exclude>META-INF/*.DSA</exclude>
+                    <exclude>META-INF/*.RSA</exclude>
+                  </excludes>
+                </filter>
+              </filters>
+              <transformers>
+                <transformer implementation="org.apache.maven.plugins.shade.resource.ManifestResourceTransformer">
+                  <manifestEntries>
+                    <Main-Class>pl.webcrawler.Main</Main-Class>
+                    <!-- Odpowiednik opcji JVM enable-native-access=ALL-UNNAMED dla java -jar:
+                         sqlite-jdbc ładuje bibliotekę natywną, a bez tego JDK wypisuje ostrzeżenie -->
+                    <Enable-Native-Access>ALL-UNNAMED</Enable-Native-Access>
+                  </manifestEntries>
+                </transformer>
+                <!-- Łączy pliki META-INF/services zależności zamiast brać tylko pierwszy -->
+                <transformer implementation="org.apache.maven.plugins.shade.resource.ServicesResourceTransformer"/>
+              </transformers>
+            </configuration>
+          </execution>
+        </executions>
       </plugin>
     </plugins>
   </build>

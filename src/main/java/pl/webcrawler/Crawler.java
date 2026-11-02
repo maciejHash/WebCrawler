@@ -1,11 +1,13 @@
 package pl.webcrawler;
 
 import java.time.Duration;
+import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ThreadFactory;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 
 /**
@@ -17,18 +19,27 @@ public class Crawler {
 
     /** Co ile sekund wypisywać postęp podczas czekania na wątki. */
     static final long PROGRESS_INTERVAL_SECONDS = 5;
+    /** Ile najczęściej znajdowanych linków pokazać w raporcie. */
+    static final int MOST_SEEN_LIMIT = 10;
 
     /**
-     * Wynik jednego uruchomienia.
+     * Wynik jednego uruchomienia - dane do raportu.
      *
      * @param countByStatus liczba linków w bazie w każdym statusie (cała baza, także z poprzednich uruchomień)
+     * @param mostSeen      najczęściej znajdowane linki, od największego seen
+     * @param pagesByWorker liczba stron pobranych przez każdy wątek (cała baza)
      * @param pagesFetched  liczba żądań HTTP wykonanych w tym uruchomieniu
      * @param duration      czas od przygotowania bazy do zakończenia wszystkich wątków
+     * @param stopped       czy pracę zatrzymano przed końcem (np. Ctrl+C)
      */
-    public record Stats(Map<String, Integer> countByStatus, int pagesFetched, Duration duration) {
+    public record Stats(Map<String, Integer> countByStatus, List<DBConn.LinkRow> mostSeen,
+                        Map<String, Integer> pagesByWorker, int pagesFetched, Duration duration,
+                        boolean stopped) {
     }
 
     private final CrawlerConfig config;
+    /** Wspólna dla wszystkich wątków; AtomicBoolean, bo ustawia ją inny wątek (shutdown hook). */
+    private final AtomicBoolean stopRequested = new AtomicBoolean();
 
     public Crawler(CrawlerConfig config) {
         this.config = config;
@@ -46,22 +57,38 @@ public class Crawler {
             for (int i = 0; i < config.threads(); i++) {
                 // execute, a nie submit: przy submit wyjątek z wątku zostałby po cichu
                 // schowany w Future; tu JVM wypisze go razem z nazwą wątku.
-                pool.execute(new CrawlerThread(db, config, pagesFetched));
+                pool.execute(new CrawlerThread(db, config, pagesFetched, stopRequested));
             }
             // shutdown nie przerywa wątków - tylko zamyka pulę na nowe zadania,
             // dzięki czemu awaitTermination zwróci true, gdy wszystkie skończą pracę.
             pool.shutdown();
             waitForThreads(pool, pagesFetched);
 
-            Map<String, Integer> counts = db.countByStatus();
-            return new Stats(counts, pagesFetched.get(), Duration.ofNanos(System.nanoTime() - start));
+            if (stopRequested.get()) {
+                log("zatrzymano - niedokończone linki zostają w bazie do wznowienia");
+            }
+            return new Stats(db.countByStatus(), db.findMostSeen(MOST_SEEN_LIMIT),
+                    db.countPagesByWorker(), pagesFetched.get(),
+                    Duration.ofNanos(System.nanoTime() - start), stopRequested.get());
         } finally {
             db.disconnect();
         }
     }
 
+    /**
+     * Prosi wątki o zakończenie pracy po bieżącej stronie. Nie czeka - {@link #run()}
+     * zwróci wynik, gdy wszystkie wątki skończą. Można wywołać z dowolnego wątku.
+     */
+    public void requestStop() {
+        stopRequested.set(true);
+    }
+
     private void prepareDatabase(DBConn db) {
         db.connect();
+        if (config.fresh()) {
+            db.dropTables();
+            log("--fresh: usunięto dane poprzednich uruchomień");
+        }
         db.createTables();
         int reset = db.resetInProgress();
         if (reset > 0) {

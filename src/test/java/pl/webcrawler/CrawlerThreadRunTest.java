@@ -52,6 +52,7 @@ class CrawlerThreadRunTest {
     private final Queue<String> requestedPaths = new ConcurrentLinkedQueue<>();
     private DBConn db;
     private final AtomicInteger pagesFetched = new AtomicInteger();
+    private final AtomicBoolean stopRequested = new AtomicBoolean();
 
     @BeforeEach
     void setUp() throws IOException {
@@ -100,7 +101,7 @@ class CrawlerThreadRunTest {
 
     private CrawlerConfig config(int threads, int maxPages, int maxDepth) {
         return new CrawlerConfig(base + "/", threads, maxPages, maxDepth, true,
-                tempDir.resolve("crawl.db").toString(), 2_000, 0, "test-agent");
+                tempDir.resolve("crawl.db").toString(), false, 2_000, 0, "test-agent");
     }
 
     /** Uruchamia wątki tak jak zrobi to Crawler i czeka, aż wszystkie same się zakończą. */
@@ -109,7 +110,7 @@ class CrawlerThreadRunTest {
         ExecutorService pool = Executors.newFixedThreadPool(config.threads());
         List<Future<?>> futures = new ArrayList<>();
         for (int i = 0; i < config.threads(); i++) {
-            futures.add(pool.submit(new CrawlerThread(db, config, pagesFetched)));
+            futures.add(pool.submit(new CrawlerThread(db, config, pagesFetched, stopRequested)));
         }
         pool.shutdown();
         assertTrue(pool.awaitTermination(15, TimeUnit.SECONDS), "wątki nie zakończyły pracy");
@@ -175,6 +176,36 @@ class CrawlerThreadRunTest {
     }
 
     @Test
+    void stopFlagEndsLoopBeforeTakingAnyLink() {
+        db.insertRow(base + "/", 0);
+        stopRequested.set(true);
+
+        new CrawlerThread(db, config(1, 100, 3), pagesFetched, stopRequested).run();
+
+        assertTrue(requestedPaths.isEmpty(), "po zatrzymaniu nie wolno pobierać stron");
+        // Link nie został przejęty - czeka w bazie na następne uruchomienie.
+        assertEquals("NEW", row("/").status());
+        assertEquals(0, pagesFetched.get());
+    }
+
+    @Test
+    void stopFlagLetsWaitingThreadFinish() throws Exception {
+        // Jak w teście przerwania: wątek czeka na pracę, bo link jest IN_PROGRESS gdzie indziej.
+        db.insertRow(base + "/", 0);
+        db.claimNextLink("other-worker", 3);
+        Thread thread = new Thread(
+                new CrawlerThread(db, config(1, 100, 3), pagesFetched, stopRequested), "crawler-test");
+        thread.start();
+        Thread.sleep(3 * CrawlerThread.WAIT_FOR_WORK_MS);
+        assertTrue(thread.isAlive(), "wątek powinien czekać na pracę");
+
+        stopRequested.set(true);
+        thread.join(5_000);
+
+        assertFalse(thread.isAlive(), "flaga stop musi zakończyć oczekiwanie bez przerywania wątku");
+    }
+
+    @Test
     void interruptEndsLoopAndKeepsInterruptFlag() throws Exception {
         // Link IN_PROGRESS u "kogoś innego": wątek nie ma co przejąć, ale nie może skończyć,
         // więc czeka w pętli - dopóki go nie przerwiemy.
@@ -183,7 +214,7 @@ class CrawlerThreadRunTest {
 
         AtomicBoolean flagAfterRun = new AtomicBoolean();
         Thread thread = new Thread(() -> {
-            new CrawlerThread(db, config(1, 100, 3), pagesFetched).run();
+            new CrawlerThread(db, config(1, 100, 3), pagesFetched, stopRequested).run();
             flagAfterRun.set(Thread.currentThread().isInterrupted());
         }, "crawler-test");
         thread.start();
