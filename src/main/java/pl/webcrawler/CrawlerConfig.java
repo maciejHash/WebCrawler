@@ -1,0 +1,68 @@
+package pl.webcrawler;
+
+/**
+ * Ustawienia jednego uruchomienia robota. Record, bo konfiguracja po utworzeniu
+ * się nie zmienia, a wątki mogą ją bezpiecznie współdzielić.
+ *
+ * @param startUrl     adres pierwszej strony (zapisywany po normalizacji)
+ * @param threads      liczba wątków w puli
+ * @param maxPages     wspólny dla wszystkich wątków limit pobranych stron
+ * @param maxDepth     maksymalna głębokość; strona startowa ma głębokość 0
+ * @param sameHostOnly czy odwiedzać tylko strony z hosta startowego
+ * @param dbPath       ścieżka do pliku bazy SQLite
+ * @param timeoutMs    limit czasu jednego żądania HTTP
+ * @param delayMs      przerwa po każdym żądaniu, żeby nie przeciążać serwera
+ * @param userAgent    nagłówek User-Agent wysyłany z każdym żądaniem
+ */
+public record CrawlerConfig(String startUrl, int threads, int maxPages, int maxDepth,
+                            boolean sameHostOnly, String dbPath, int timeoutMs, int delayMs,
+                            String userAgent) {
+
+    public static final int DEFAULT_THREADS = 4;
+    public static final int DEFAULT_MAX_PAGES = 100;
+    public static final int DEFAULT_MAX_DEPTH = 3;
+    public static final boolean DEFAULT_SAME_HOST_ONLY = true;
+    public static final String DEFAULT_DB_PATH = "crawler.db";
+    public static final int DEFAULT_TIMEOUT_MS = 10_000;
+    public static final int DEFAULT_DELAY_MS = 500;
+    // Tylko ASCII - nagłówki HTTP nie powinny zawierać innych znaków.
+    public static final String DEFAULT_USER_AGENT = "pl.webcrawler/1.0 (student project)";
+
+    /**
+     * Sprawdza wartości od razu przy tworzeniu, żeby błąd w argumentach wyszedł na starcie,
+     * a nie w połowie pracy wątków. Adres startowy jest normalizowany tak samo jak
+     * każdy inny link, żeby trafił do bazy w tej samej postaci.
+     */
+    public CrawlerConfig {
+        if (startUrl == null) {
+            throw new IllegalArgumentException("Brak adresu startowego");
+        }
+        String original = startUrl;
+        startUrl = UrlUtils.normalize(startUrl).orElseThrow(() ->
+                new IllegalArgumentException("Niepoprawny adres startowy (wymagany http/https): " + original));
+        requireAtLeast("threads", threads, 1);
+        requireAtLeast("maxPages", maxPages, 1);
+        requireAtLeast("maxDepth", maxDepth, 0);
+        requireAtLeast("timeoutMs", timeoutMs, 1);
+        requireAtLeast("delayMs", delayMs, 0);
+        if (dbPath == null || dbPath.isBlank()) {
+            throw new IllegalArgumentException("Brak ścieżki do bazy");
+        }
+        if (userAgent == null || userAgent.isBlank()) {
+            throw new IllegalArgumentException("Brak User-Agent");
+        }
+    }
+
+    /** Konfiguracja z wartościami domyślnymi dla podanego adresu startowego. */
+    public static CrawlerConfig withDefaults(String startUrl) {
+        return new CrawlerConfig(startUrl, DEFAULT_THREADS, DEFAULT_MAX_PAGES, DEFAULT_MAX_DEPTH,
+                DEFAULT_SAME_HOST_ONLY, DEFAULT_DB_PATH, DEFAULT_TIMEOUT_MS, DEFAULT_DELAY_MS,
+                DEFAULT_USER_AGENT);
+    }
+
+    private static void requireAtLeast(String name, int value, int min) {
+        if (value < min) {
+            throw new IllegalArgumentException(name + " musi być >= " + min + ", podano: " + value);
+        }
+    }
+}
