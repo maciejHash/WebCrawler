@@ -48,6 +48,32 @@ class DBConnTest {
     }
 
     @Test
+    void addSeedTwiceKeepsSeenAtOne() {
+        assertTrue(db.addSeed(URL), "pierwsze wywołanie dodaje wiersz");
+        assertFalse(db.addSeed(URL), "drugie wywołanie niczego nie zmienia");
+
+        DBConn.LinkRow row = db.findByUrl(URL).orElseThrow();
+        assertEquals(0, row.depth());
+        assertEquals(1, row.seen());
+        assertEquals("NEW", row.status());
+    }
+
+    @Test
+    void addSeedLeavesExistingLinkUntouched() {
+        db.insertRow(URL, 0);
+        db.insertRow(URL, 0);
+        long id = db.claimNextLink("crawler-1", 5).orElseThrow().id();
+        db.markVisited(id);
+
+        assertFalse(db.addSeed(URL));
+
+        DBConn.LinkRow row = db.findByUrl(URL).orElseThrow();
+        assertEquals(2, row.seen());
+        assertEquals("VISITED", row.status());
+        assertEquals("crawler-1", row.claimedBy());
+    }
+
+    @Test
     void newLinkHasSeenOneAndStatusNew() {
         db.insertRow(URL, 2);
 

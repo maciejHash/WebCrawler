@@ -44,6 +44,11 @@ public class DBConn implements AutoCloseable {
                 seen  = seen + 1,
                 depth = MIN(depth, excluded.depth)""";
 
+    // Adres startowy: OR IGNORE, a nie UPSERT, bo ponowne uruchomienie na tej samej bazie
+    // to wznowienie pracy, a nie kolejne "znalezienie" linku - seen nie może rosnąć.
+    private static final String INSERT_SEED =
+            "INSERT OR IGNORE INTO links (url, depth) VALUES (?, 0)";
+
     private static final String SELECT_BY_URL = """
             SELECT id, url, depth, seen, status, claimed_by, visited_at, error
             FROM links WHERE url = ?""";
@@ -144,6 +149,21 @@ public class DBConn implements AutoCloseable {
             stmt.executeUpdate();
         } catch (SQLException e) {
             throw new DatabaseException("Nie można zapisać linku: " + url, e);
+        }
+    }
+
+    /**
+     * Dodaje adres startowy z głębokością 0. Jeśli adres już jest w bazie (wznowienie),
+     * wiersz zostaje bez zmian - łącznie z seen, depth i statusem.
+     *
+     * @return true, gdy wiersz faktycznie dodano
+     */
+    public synchronized boolean addSeed(String url) {
+        try (PreparedStatement stmt = openConnection().prepareStatement(INSERT_SEED)) {
+            stmt.setString(1, url);
+            return stmt.executeUpdate() == 1;
+        } catch (SQLException e) {
+            throw new DatabaseException("Nie można dodać adresu startowego: " + url, e);
         }
     }
 
