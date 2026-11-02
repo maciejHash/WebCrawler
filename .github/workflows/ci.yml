@@ -1,0 +1,32 @@
+# Buduje projekt i uruchamia wszystkie testy przy każdym pushu i pull requeście.
+# Testy nie łączą się z internetem (lokalny HttpServer z JDK), więc działają w CI.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Instalacja JDK 27
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '27'
+          cache: maven
+
+      - name: Kompilacja, testy i budowa JAR-a
+        run: mvn -B verify
+
+      - name: Zapis web-crawler.jar jako artefakt
+        uses: actions/upload-artifact@v4
+        with:
+          name: web-crawler
+          path: target/web-crawler.jar

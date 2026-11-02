@@ -157,6 +157,10 @@ public class Main {
         return number;
     }
 
+    /**
+     * Błędne argumenty kończą program kodem {@value #EXIT_USAGE}, błąd bazy kodem
+     * {@value #EXIT_ERROR}; poprawne zakończenie (także po Ctrl+C) - kodem 0.
+     */
     public static void main(String[] args) {
         if (isHelpRequested(args)) {
             System.out.print(usage());

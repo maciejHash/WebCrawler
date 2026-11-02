@@ -15,7 +15,7 @@ import java.util.TreeMap;
 /**
  * Cała obsługa bazy SQLite. Jedna instancja jest współdzielona przez wszystkie wątki,
  * dlatego metody publiczne są synchronized - w danej chwili z połączenia korzysta
- * tylko jeden wątek (obiekt Connection z JDBC nie jest bezpieczny wielowątkowo)
+ * tylko jeden wątek (obiekt Connection z JDBC nie jest bezpieczny wielowątkowo).
  */
 public class DBConn implements AutoCloseable {
 
@@ -32,7 +32,7 @@ public class DBConn implements AutoCloseable {
                 error      TEXT
             )""";
 
-    // Wątki szukają linków po statusie i głębokości – indeks przyspiesza to wyszukiwanie.
+    // Wątki szukają linków po statusie i głębokości - indeks przyspiesza to wyszukiwanie.
     private static final String CREATE_INDEX =
             "CREATE INDEX IF NOT EXISTS idx_links_status_depth ON links (status, depth)";
 
@@ -126,6 +126,7 @@ public class DBConn implements AutoCloseable {
     private final String dbPath;
     private Connection connection;
 
+    /** Samo utworzenie obiektu nie otwiera bazy - do tego służy {@link #connect()}. */
     public DBConn(String dbPath) {
         this.dbPath = dbPath;
     }
@@ -270,7 +271,7 @@ public class DBConn implements AutoCloseable {
         }
     }
 
-    /** Link świadomie pominięty (np. nie jest stroną HTML albo wyczerpano limit stron). */
+    /** Link świadomie pominięty bez żądania HTTP: obcy host albo plik binarny. */
     public synchronized void markSkipped(long id) {
         updateById(MARK_SKIPPED, id, "Nie można oznaczyć linku jako SKIPPED: ");
     }

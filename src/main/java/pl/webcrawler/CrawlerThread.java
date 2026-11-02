@@ -31,6 +31,8 @@ public class CrawlerThread implements Runnable {
     private final AtomicBoolean stopRequested;
 
     /**
+     * Wszystkie wątki dostają te same obiekty db, config, pagesFetched i stopRequested.
+     *
      * @param pagesFetched  licznik wspólny dla wszystkich wątków; dzięki niemu limit
      *                      maxPages dotyczy całego robota, a nie pojedynczego wątku
      * @param stopRequested flaga wspólna dla wszystkich wątków; ustawiona (np. po Ctrl+C)

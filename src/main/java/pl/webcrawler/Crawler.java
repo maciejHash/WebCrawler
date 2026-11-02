@@ -41,10 +41,17 @@ public class Crawler {
     /** Wspólna dla wszystkich wątków; AtomicBoolean, bo ustawia ją inny wątek (shutdown hook). */
     private final AtomicBoolean stopRequested = new AtomicBoolean();
 
+    /** @param config ustawienia uruchomienia; ten sam obiekt dostają wszystkie wątki */
     public Crawler(CrawlerConfig config) {
         this.config = config;
     }
 
+    /**
+     * Uruchamia robota i blokuje do zakończenia pracy wszystkich wątków.
+     * Połączenie z bazą jest zamykane także wtedy, gdy wystąpi błąd.
+     *
+     * @throws DatabaseException gdy nie da się otworzyć lub przygotować bazy
+     */
     public Stats run() {
         long start = System.nanoTime();
         DBConn db = new DBConn(config.dbPath());

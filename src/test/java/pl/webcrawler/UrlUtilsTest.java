@@ -11,6 +11,7 @@ import org.junit.jupiter.params.provider.CsvSource;
 import org.junit.jupiter.params.provider.NullAndEmptySource;
 import org.junit.jupiter.params.provider.ValueSource;
 
+/** Normalizacja adresów, porównywanie hostów i rozpoznawanie plików binarnych. */
 class UrlUtilsTest {
 
     @ParameterizedTest(name = "{0} -> {1}")

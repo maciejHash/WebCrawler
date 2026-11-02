@@ -56,13 +56,6 @@ public record CrawlerConfig(String startUrl, int threads, int maxPages, int maxD
         }
     }
 
-    /** Konfiguracja z wartościami domyślnymi dla podanego adresu startowego. */
-    public static CrawlerConfig withDefaults(String startUrl) {
-        return new CrawlerConfig(startUrl, DEFAULT_THREADS, DEFAULT_MAX_PAGES, DEFAULT_MAX_DEPTH,
-                DEFAULT_SAME_HOST_ONLY, DEFAULT_DB_PATH, DEFAULT_FRESH, DEFAULT_TIMEOUT_MS,
-                DEFAULT_DELAY_MS, DEFAULT_USER_AGENT);
-    }
-
     private static void requireAtLeast(String name, int value, int min) {
         if (value < min) {
             throw new IllegalArgumentException(name + " musi być >= " + min + ", podano: " + value);
