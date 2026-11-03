@@ -12,6 +12,7 @@ import java.net.InetSocketAddress;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
 import java.sql.SQLException;
+import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
@@ -75,12 +76,14 @@ class CrawlerFailureTest {
             this.releaseFails = releaseFails;
         }
 
+        // CrawlerThread zapisuje linki strony przez saveVisitedPage, a nie insertRow -
+        // nadpisanie insertRow nie wstrzyknęłoby żadnego błędu i testy by nie przeszły.
         @Override
-        public synchronized void insertRow(String url, int depth) {
-            if (url.equals(failOnUrl)) {
+        public synchronized void saveVisitedPage(long id, List<String> links, int linkDepth) {
+            if (links.contains(failOnUrl)) {
                 throw failure;
             }
-            super.insertRow(url, depth);
+            super.saveVisitedPage(id, links, linkDepth);
         }
 
         @Override
