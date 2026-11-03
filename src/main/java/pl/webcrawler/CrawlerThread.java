@@ -152,12 +152,11 @@ public class CrawlerThread implements Runnable {
         try {
             Document doc = fetch(link.url());
             List<String> links = extractLinks(doc);
-            // Najpierw linki, potem VISITED: dopóki strona jest IN_PROGRESS, inne wątki
-            // czekają zamiast kończyć pracę, więc nie zakończą się przed zapisaniem tych linków.
-            for (String found : links) {
-                db.insertRow(found, link.depth() + 1);
-            }
-            db.markVisited(link.id());
+            // Linki i status VISITED zapisuje jedna transakcja, więc żaden wątek nie zobaczy
+            // strony VISITED bez jej linków. To ważne: dopóki strona jest IN_PROGRESS, inne
+            // wątki czekają zamiast kończyć pracę - gdyby VISITED pojawiło się przed linkami,
+            // mogłyby uznać, że pracy już nie ma, i zakończyć się przedwcześnie.
+            db.saveVisitedPage(link.id(), links, link.depth() + 1);
             log("odwiedzono " + link.url() + " (głębokość " + link.depth()
                     + ", linków: " + links.size() + ")");
         } catch (HttpStatusException e) {

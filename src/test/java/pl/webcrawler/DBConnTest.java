@@ -10,6 +10,7 @@ import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import java.nio.file.Path;
+import java.util.Arrays;
 import java.util.List;
 import java.util.Map;
 
@@ -208,6 +209,86 @@ class DBConnTest {
         assertNotNull(row.visitedAt());
         assertNull(row.error());
         assertEquals("w", row.claimedBy(), "po odwiedzeniu zostaje informacja, kto to zrobił");
+    }
+
+    // ---- zapis odwiedzonej strony w jednej transakcji ----
+
+    @Test
+    void saveVisitedPageStoresLinksAndMarksPageVisited() {
+        LinkRecord page = insertAndClaim(URL);
+
+        db.saveVisitedPage(page.id(), List.of(URL + "a", URL + "b", URL + "c"), 1);
+
+        DBConn.LinkRow row = db.findByUrl(URL).orElseThrow();
+        assertEquals("VISITED", row.status());
+        assertNotNull(row.visitedAt());
+        assertEquals("w", row.claimedBy());
+        for (String url : List.of(URL + "a", URL + "b", URL + "c")) {
+            DBConn.LinkRow link = db.findByUrl(url).orElseThrow();
+            assertEquals(1, link.depth(), url);
+            assertEquals(1, link.seen(), url);
+            assertEquals("NEW", link.status(), url);
+        }
+        assertEquals(Map.of("VISITED", 1, "NEW", 3), db.countByStatus());
+    }
+
+    @Test
+    void saveVisitedPageCountsDuplicatesAndKeepsSmallerDepth() {
+        db.insertRow(URL + "known", 3);
+        LinkRecord page = insertAndClaim(URL);
+
+        // Ten sam adres dwa razy na stronie + jeden znany już z bazy z większą głębokością.
+        db.saveVisitedPage(page.id(), List.of(URL + "twice", URL + "known", URL + "twice"), 1);
+
+        DBConn.LinkRow twice = db.findByUrl(URL + "twice").orElseThrow();
+        assertEquals(2, twice.seen());
+        assertEquals(1, twice.depth());
+        DBConn.LinkRow known = db.findByUrl(URL + "known").orElseThrow();
+        assertEquals(2, known.seen());
+        assertEquals(1, known.depth(), "depth = MIN(3, 1)");
+    }
+
+    @Test
+    void saveVisitedPageWithoutLinksOnlyMarksPageVisited() {
+        LinkRecord page = insertAndClaim(URL);
+
+        db.saveVisitedPage(page.id(), List.of(), 1);
+
+        assertEquals(Map.of("VISITED", 1), db.countByStatus());
+    }
+
+    @Test
+    void failedSaveVisitedPageRollsBackLinksAndStatus() {
+        db.insertRow(URL + "known", 1);
+        LinkRecord page = insertAndClaim(URL);
+        // null łamie NOT NULL na kolumnie url - błąd pojawia się po dwóch poprawnych linkach.
+        List<String> links = Arrays.asList(URL + "new", URL + "known", null);
+
+        assertThrows(DatabaseException.class, () -> db.saveVisitedPage(page.id(), links, 1));
+
+        assertTrue(db.findByUrl(URL + "new").isEmpty(), "nowy link nie może zostać w bazie");
+        assertEquals(1, db.findByUrl(URL + "known").orElseThrow().seen(), "seen bez zmian");
+        DBConn.LinkRow row = db.findByUrl(URL).orElseThrow();
+        assertEquals("IN_PROGRESS", row.status());
+        assertNull(row.visitedAt());
+    }
+
+    @Test
+    void connectionWorksInAutoCommitModeAfterFailedSave() {
+        LinkRecord page = insertAndClaim(URL);
+        List<String> links = Arrays.asList(URL + "a", null);
+        assertThrows(DatabaseException.class, () -> db.saveVisitedPage(page.id(), links, 1));
+
+        db.insertRow(URL + "after", 0);
+        db.markVisited(page.id());
+
+        // Inne połączenie widzi tylko to, co zatwierdzono. Gdyby autoCommit został wyłączony,
+        // te zapisy wisiałyby w otwartej transakcji i nie byłoby ich tutaj widać.
+        try (DBConn other = new DBConn(tempDir.resolve("test.db").toString())) {
+            other.connect();
+            assertTrue(other.findByUrl(URL + "after").isPresent());
+            assertEquals("VISITED", other.findByUrl(URL).orElseThrow().status());
+        }
     }
 
     @Test

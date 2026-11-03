@@ -260,6 +260,40 @@ public class DBConn implements AutoCloseable {
         updateById(MARK_VISITED, id, "Nie można oznaczyć linku jako VISITED: ");
     }
 
+    /**
+     * Zapisuje wynik odwiedzenia strony w jednej transakcji: wszystkie znalezione linki
+     * (ten sam UPSERT co {@link #insertRow}) i status VISITED strony o podanym id.
+     * Zmiany widać w bazie albo wszystkie, albo żadnej - przerwanie w połowie nie zostawi
+     * strony IN_PROGRESS z częścią linków (przy wznowieniu seen rosłoby drugi raz).
+     * Przy okazji jeden COMMIT zamiast osobnego zapisu na dysk dla każdego linku.
+     *
+     * @param links     znalezione adresy (już znormalizowane), duplikaty zwiększają seen
+     * @param linkDepth głębokość znalezionych linków, czyli głębokość strony + 1
+     */
+    public synchronized void saveVisitedPage(long id, List<String> links, int linkDepth) {
+        Connection conn = openConnection();
+        try {
+            conn.setAutoCommit(false);
+            try (PreparedStatement upsert = conn.prepareStatement(UPSERT_LINK);
+                 PreparedStatement visited = conn.prepareStatement(MARK_VISITED)) {
+                for (String url : links) {
+                    upsert.setString(1, url);
+                    upsert.setInt(2, linkDepth);
+                    upsert.addBatch();
+                }
+                upsert.executeBatch();
+                visited.setLong(1, id);
+                visited.executeUpdate();
+            }
+            conn.commit();
+        } catch (SQLException e) {
+            rollback(conn, e);
+            throw new DatabaseException("Nie można zapisać odwiedzonej strony: " + id, e);
+        } finally {
+            restoreAutoCommit(conn);
+        }
+    }
+
     /** Nie udało się pobrać strony; message trafia do kolumny error. */
     public synchronized void markError(long id, String message) {
         try (PreparedStatement stmt = openConnection().prepareStatement(MARK_ERROR)) {
@@ -408,6 +442,30 @@ public class DBConn implements AutoCloseable {
             stmt.executeUpdate();
         } catch (SQLException e) {
             throw new DatabaseException(errorMessage + id, e);
+        }
+    }
+
+    /**
+     * Cofa transakcję po błędzie. Jeśli i to się nie uda, ważniejszy jest pierwotny błąd -
+     * błąd rollbacku dołączamy do niego jako "suppressed", żeby nie zginął z logów.
+     */
+    private static void rollback(Connection conn, SQLException cause) {
+        try {
+            conn.rollback();
+        } catch (SQLException rollbackError) {
+            cause.addSuppressed(rollbackError);
+        }
+    }
+
+    /**
+     * Przywraca tryb autoCommit, w którym działają wszystkie pozostałe metody - bez tego
+     * każdy kolejny insertRow czy claimNextLink czekałby w niezatwierdzonej transakcji.
+     */
+    private static void restoreAutoCommit(Connection conn) {
+        try {
+            conn.setAutoCommit(true);
+        } catch (SQLException e) {
+            throw new DatabaseException("Nie można przywrócić trybu autoCommit", e);
         }
     }
 

@@ -128,7 +128,7 @@ Indeks na `(status, depth)` przyspiesza najczęstsze zapytanie: „daj linki `NE
 stateDiagram-v2
     [*] --> NEW: insertRow / addSeed
     NEW --> IN_PROGRESS: claimNextLink
-    IN_PROGRESS --> VISITED: markVisited
+    IN_PROGRESS --> VISITED: saveVisitedPage / markVisited
     IN_PROGRESS --> ERROR: markError
     IN_PROGRESS --> SKIPPED: markSkipped
     IN_PROGRESS --> NEW: releaseLink / resetInProgress
@@ -172,8 +172,7 @@ flowchart TD
     reserve -- tak --> release["cofnij licznik<br/>db.releaseLink()"] --> finish
     reserve -- nie --> fetch["Jsoup.connect(url).get()"]
     fetch -- sukces --> extract["extractLinks()<br/>absUrl + UrlUtils.normalize"]
-    extract --> insert["db.insertRow() dla każdego linku<br/>depth + 1"]
-    insert --> visited["db.markVisited()"]
+    extract --> visited["db.saveVisitedPage()<br/>jedna transakcja: UPSERT linków (depth + 1)<br/>+ status VISITED"]
     fetch -- "HTTP 4xx/5xx, timeout, zły typ,<br/>błąd sieci, inny RuntimeException" --> error["db.markError()<br/>klasa + komunikat"]
     visited --> delay["sleep delayMs"]
     error --> delay
@@ -182,10 +181,11 @@ flowchart TD
     dbstop --> finish
 ```
 
-Kolejność „najpierw `insertRow`, potem `markVisited`” jest celowa: dopóki strona jest `IN_PROGRESS`,
-inne wątki widzą w `hasPendingWork`, że praca może się jeszcze pojawić, i czekają zamiast kończyć.
-Gdyby strona została oznaczona jako `VISITED` przed zapisaniem linków, pozostałe wątki mogłyby
-zakończyć się w tej krótkiej chwili, zostawiając całą pracę jednemu wątkowi.
+Linki strony i jej status `VISITED` są zapisywane w jednej transakcji (`saveVisitedPage`), więc żaden
+wątek nie zobaczy strony `VISITED` bez jej linków. To ważne dla kończenia pracy: dopóki strona jest
+`IN_PROGRESS`, inne wątki widzą w `hasPendingWork`, że praca może się jeszcze pojawić, i czekają zamiast kończyć.
+Gdyby `VISITED` pojawiło się przed linkami, pozostałe wątki mogłyby zakończyć się w tej krótkiej chwili,
+zostawiając całą pracę jednemu wątkowi.
 
 Przerwanie wątku (np. `shutdownNow`) w trakcie pobierania oddaje link (`releaseLink`) - strona
 nie jest wadliwa, więc nie dostaje statusu `ERROR`. Dlatego `Crawler` po `shutdownNow()` czeka jeszcze
@@ -292,6 +292,25 @@ Przy starcie nie działa jeszcze żaden wątek, więc linki `IN_PROGRESS` zosta�
 uruchomieniu i nie mają właściciela. Bez tego kroku nikt by ich nie odwiedził, a `hasPendingWork`
 wiecznie widziałby niedokończoną pracę.
 
+### 6. Zapis odwiedzonej strony w jednej transakcji
+
+Po pobraniu strony `saveVisitedPage` zapisuje wszystkie znalezione linki (ten sam UPSERT co w punkcie 1,
+wysyłany paczką przez `addBatch`/`executeBatch`) i zmienia status strony na `VISITED` - w jednej transakcji:
+
+```sql
+BEGIN;
+INSERT INTO links (url, depth) VALUES (?, ?) ON CONFLICT(url) DO UPDATE ...;  -- dla każdego linku
+UPDATE links SET status = 'VISITED', visited_at = CURRENT_TIMESTAMP, error = NULL WHERE id = ?;
+COMMIT;  -- przy błędzie ROLLBACK; autoCommit jest zawsze przywracany
+```
+
+W bazie widać albo wszystkie te zmiany, albo żadną. Jeśli program zostanie przerwany (albo zapis się nie uda)
+w połowie, strona zostaje `IN_PROGRESS` bez żadnego ze swoich linków; przy wznowieniu wraca do `NEW`
+(punkt 5) i jest pobierana ponownie, ale jej linki są liczone w `seen` tylko raz. Bez transakcji część
+linków zostałaby zapisana dwukrotnie, a `seen` wzrósłby o 2. Inne wątki nigdy nie widzą strony `VISITED`
+bez jej linków, co ma znaczenie dla [kończenia pracy](#pętla-crawlerthread). Dodatkowo jeden `COMMIT`
+na stronę zamiast osobnego zapisu na dysk dla każdego linku przyspiesza pracę.
+
 ### Koniec pracy i limit stron
 
 Wątek kończy pracę, gdy nie może przejąć linku, a jedno zapytanie pokazuje, że nie ma już nic do zrobienia:
@@ -330,7 +349,7 @@ lokalny `com.sun.net.httpserver.HttpServer` z JDK.
 | `DBConnConcurrencyTest` | 8 wątków przejmuje 200 linków - każdy link trafia do dokładnie jednego wątku (wspólne i osobne połączenia, test powtarzany). |
 | `CrawlerThreadRunTest` | Cała pętla `run()` na lokalnej stronie: statusy, `seen`, limit stron, zatrzymanie. |
 | `CrawlerTest`, `CrawlerEndToEndTest` | Cały robot z pulą wątków: każda strona pobrana dokładnie raz (licznik żądań po stronie serwera), cykle, duplikaty, 404, wznowienie. |
-| `CrawlerFailureTest` | Wyjątki w wątkach (podklasa `DBConn` rzucająca z `insertRow`): nieoczekiwany błąd strony daje `ERROR` i nie zawiesza robota, `DatabaseException` wychodzi z `Crawler.run()`, a link wraca do `NEW`. |
+| `CrawlerFailureTest` | Wyjątki w wątkach (podklasa `DBConn` rzucająca z `saveVisitedPage`): nieoczekiwany błąd strony daje `ERROR` i nie zawiesza robota, `DatabaseException` wychodzi z `Crawler.run()`, a link wraca do `NEW`. |
 | `MainTest` | Parsowanie argumentów, pomoc, tekst raportu. |
 
 GitHub Actions (`.github/workflows/ci.yml`) uruchamia `mvn -B verify` na JDK 27 przy każdym pushu
@@ -346,8 +365,6 @@ do `main` i każdym pull requeście, a gotowy `web-crawler.jar` zapisuje jako ar
 - **Przerwa `--delay` jest na wątek, nie na serwer** - przy 4 wątkach serwer dostaje do 4 żądań w czasie jednej przerwy.
 - **Pliki binarne rozpoznawane po rozszerzeniu.** `/pobierz.php?f=a.pdf` zostanie pobrany; jsoup odrzuci go
   dopiero po nagłówku `Content-Type` (status `ERROR`).
-- **Zapis strony nie jest transakcją.** Jeśli program zostanie przerwany po zapisaniu części linków,
-  a przed `markVisited`, przy wznowieniu strona zostanie pobrana ponownie, a `seen` jej linków wzrośnie drugi raz.
 - **Jedno połączenie z bazą** - wszystkie operacje na bazie są wykonywane po kolei. Przy kilku wątkach
   wąskim gardłem jest sieć, ale przy dziesiątkach wątków byłaby nim baza.
 - **Domeny IDN** (z polskimi znakami w nazwie hosta) są odrzucane.
@@ -359,7 +376,6 @@ do `main` i każdym pull requeście, a gotowy `web-crawler.jar` zapisuje jako ar
 - Pobieranie i respektowanie `robots.txt` (w tym `Crawl-delay`).
 - Wspólny limit tempa na host zamiast przerwy w każdym wątku.
 - Zapisywanie adresu docelowego po przekierowaniu i `rel="canonical"`, żeby wykrywać kolejne duplikaty.
-- Zapis linków strony i `markVisited` w jednej transakcji (szybciej i bez podwójnego `seen` przy wznowieniu).
 - Ponawianie stron z błędem przejściowym (timeout, HTTP 5xx) z ograniczoną liczbą prób.
 - Kolejność odwiedzin według głębokości (`ORDER BY depth, id`) - ścisłe przeszukiwanie wszerz.
 - Opcje `--timeout` i `--user-agent` w wierszu poleceń.
