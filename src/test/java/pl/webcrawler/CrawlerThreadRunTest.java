@@ -21,6 +21,7 @@ import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReference;
 
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
@@ -53,6 +54,7 @@ class CrawlerThreadRunTest {
     private DBConn db;
     private final AtomicInteger pagesFetched = new AtomicInteger();
     private final AtomicBoolean stopRequested = new AtomicBoolean();
+    private final AtomicReference<DatabaseException> dbFailure = new AtomicReference<>();
 
     @BeforeEach
     void setUp() throws IOException {
@@ -110,7 +112,7 @@ class CrawlerThreadRunTest {
         ExecutorService pool = Executors.newFixedThreadPool(config.threads());
         List<Future<?>> futures = new ArrayList<>();
         for (int i = 0; i < config.threads(); i++) {
-            futures.add(pool.submit(new CrawlerThread(db, config, pagesFetched, stopRequested)));
+            futures.add(pool.submit(new CrawlerThread(db, config, pagesFetched, stopRequested, dbFailure)));
         }
         pool.shutdown();
         assertTrue(pool.awaitTermination(15, TimeUnit.SECONDS), "wątki nie zakończyły pracy");
@@ -180,7 +182,7 @@ class CrawlerThreadRunTest {
         db.insertRow(base + "/", 0);
         stopRequested.set(true);
 
-        new CrawlerThread(db, config(1, 100, 3), pagesFetched, stopRequested).run();
+        new CrawlerThread(db, config(1, 100, 3), pagesFetched, stopRequested, dbFailure).run();
 
         assertTrue(requestedPaths.isEmpty(), "po zatrzymaniu nie wolno pobierać stron");
         // Link nie został przejęty - czeka w bazie na następne uruchomienie.
@@ -194,7 +196,7 @@ class CrawlerThreadRunTest {
         db.insertRow(base + "/", 0);
         db.claimNextLink("other-worker", 3);
         Thread thread = new Thread(
-                new CrawlerThread(db, config(1, 100, 3), pagesFetched, stopRequested), "crawler-test");
+                new CrawlerThread(db, config(1, 100, 3), pagesFetched, stopRequested, dbFailure), "crawler-test");
         thread.start();
         Thread.sleep(3 * CrawlerThread.WAIT_FOR_WORK_MS);
         assertTrue(thread.isAlive(), "wątek powinien czekać na pracę");
@@ -214,7 +216,7 @@ class CrawlerThreadRunTest {
 
         AtomicBoolean flagAfterRun = new AtomicBoolean();
         Thread thread = new Thread(() -> {
-            new CrawlerThread(db, config(1, 100, 3), pagesFetched, stopRequested).run();
+            new CrawlerThread(db, config(1, 100, 3), pagesFetched, stopRequested, dbFailure).run();
             flagAfterRun.set(Thread.currentThread().isInterrupted());
         }, "crawler-test");
         thread.start();

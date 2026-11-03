@@ -7,6 +7,7 @@ import java.util.List;
 import java.util.Optional;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReference;
 
 import org.jsoup.HttpStatusException;
 import org.jsoup.Jsoup;
@@ -29,27 +30,34 @@ public class CrawlerThread implements Runnable {
     private final CrawlerConfig config;
     private final AtomicInteger pagesFetched;
     private final AtomicBoolean stopRequested;
+    private final AtomicReference<DatabaseException> dbFailure;
 
     /**
-     * Wszystkie wątki dostają te same obiekty db, config, pagesFetched i stopRequested.
+     * Wszystkie wątki dostają te same obiekty db, config, pagesFetched, stopRequested i dbFailure.
      *
      * @param pagesFetched  licznik wspólny dla wszystkich wątków; dzięki niemu limit
      *                      maxPages dotyczy całego robota, a nie pojedynczego wątku
      * @param stopRequested flaga wspólna dla wszystkich wątków; ustawiona (np. po Ctrl+C)
      *                      oznacza: dokończ bieżącą stronę i nie bierz kolejnej
+     * @param dbFailure     tu wątek zapisuje błąd bazy; run() z Runnable nie może rzucić
+     *                      wyjątku do Crawlera, więc przekazujemy go przez wspólny obiekt
      */
     public CrawlerThread(DBConn db, CrawlerConfig config, AtomicInteger pagesFetched,
-                         AtomicBoolean stopRequested) {
+                         AtomicBoolean stopRequested, AtomicReference<DatabaseException> dbFailure) {
         this.db = db;
         this.config = config;
         this.pagesFetched = pagesFetched;
         this.stopRequested = stopRequested;
+        this.dbFailure = dbFailure;
     }
 
     @Override
     public void run() {
         String workerName = Thread.currentThread().getName();
         log("start");
+        // Link przejęty i jeszcze nieobsłużony - przy błędzie bazy trzeba go oddać,
+        // inaczej zostałby IN_PROGRESS, a pozostałe wątki czekałyby na niego bez końca.
+        LinkRecord current = null;
         try {
             while (!Thread.currentThread().isInterrupted()) {
                 // Łagodne zatrzymanie: flagę sprawdzamy tylko tutaj, między stronami, więc
@@ -75,7 +83,11 @@ public class CrawlerThread implements Runnable {
                     Thread.sleep(WAIT_FOR_WORK_MS);
                     continue;
                 }
-                if (!process(claimed.get())) {
+                current = claimed.get();
+                boolean keepWorking = process(current);
+                // Po process() link ma status końcowy albo został oddany - nie jest już nasz.
+                current = null;
+                if (!keepWorking) {
                     break;
                 }
             }
@@ -84,14 +96,40 @@ public class CrawlerThread implements Runnable {
             // (np. ExecutorService przy shutdownNow) wiedział, że wątek przerwano.
             Thread.currentThread().interrupt();
             log("przerwano");
+        } catch (DatabaseException e) {
+            stopAfterDatabaseError(e, current);
         }
         log("koniec");
+    }
+
+    /**
+     * Błąd bazy to nie błąd jednej strony: każdy kolejny zapis też może się nie udać,
+     * więc nie ma sensu pracować dalej. Oddajemy link, zapisujemy błąd dla Crawlera
+     * i prosimy pozostałe wątki o łagodne zatrzymanie.
+     */
+    private void stopAfterDatabaseError(DatabaseException e, LinkRecord current) {
+        // Zapisujemy tylko pierwszy błąd: inne wątki mogą zaraz trafić na ten sam problem.
+        dbFailure.compareAndSet(null, e);
+        // Flaga przed oddaniem linku: inaczej inny wątek mógłby go od razu przejąć
+        // i pobrać stronę jeszcze raz tylko po to, żeby trafić na ten sam błąd.
+        stopRequested.set(true);
+        if (current != null) {
+            try {
+                db.releaseLink(current.id());
+            } catch (RuntimeException releaseError) {
+                // Baza nadal nie działa - ważniejszy jest pierwotny błąd. Link zostaje
+                // IN_PROGRESS, a przy następnym starcie resetInProgress przywróci go do NEW.
+                logError("nie udało się oddać " + current.url() + ": " + releaseError.getMessage());
+            }
+        }
+        logError("błąd bazy danych, zatrzymywanie robota: " + e.getMessage());
     }
 
     /**
      * Obsługuje jeden przejęty link.
      *
      * @return false, gdy wątek ma zakończyć pracę (wyczerpany limit stron)
+     * @throws DatabaseException gdy nie działa baza - to obsługuje {@link #run()}, nie ta metoda
      */
     private boolean process(LinkRecord link) throws InterruptedException {
         if (shouldSkip(link.url())) {
@@ -128,9 +166,14 @@ public class CrawlerThread implements Runnable {
             markError(link, "Nieobsługiwany typ treści: " + e.getMimeType());
         } catch (SocketTimeoutException e) {
             markError(link, "Przekroczono czas oczekiwania (" + config.timeoutMs() + " ms)");
-        } catch (IOException | IllegalArgumentException e) {
-            // IllegalArgumentException: jsoup odrzuca niektóre adresy (np. przekierowanie
-            // na nieobsługiwany schemat) - to też błąd tej jednej strony, nie całego wątku.
+        } catch (DatabaseException e) {
+            // Błąd bazy nie jest błędem tej strony - przekazujemy go dalej do run().
+            throw e;
+        } catch (IOException | RuntimeException e) {
+            // RuntimeException to też błąd tej jednej strony, nie całego wątku: jsoup rzuca
+            // np. IllegalArgumentException (przekierowanie na nieobsługiwany schemat) albo
+            // UncheckedIOException (błąd przy czytaniu treści). Bez tego wyjątek zabiłby wątek,
+            // a strona zostałaby IN_PROGRESS na zawsze.
             if (Thread.currentThread().isInterrupted()) {
                 // Pobieranie przerwane z zewnątrz - strona nie jest wadliwa, oddajemy ją.
                 db.releaseLink(link.id());

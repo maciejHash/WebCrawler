@@ -9,6 +9,7 @@ import java.util.concurrent.ThreadFactory;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReference;
 
 /**
  * Uruchamia całego robota: przygotowuje bazę, startuje {@code threads} obiektów
@@ -38,25 +39,41 @@ public class Crawler {
     }
 
     private final CrawlerConfig config;
-    /** Wspólna dla wszystkich wątków; AtomicBoolean, bo ustawia ją inny wątek (shutdown hook). */
+    private final DBConn db;
+    /**
+     * Wspólna dla wszystkich wątków; AtomicBoolean, bo ustawiają ją inne wątki
+     * (shutdown hook albo CrawlerThread po błędzie bazy).
+     */
     private final AtomicBoolean stopRequested = new AtomicBoolean();
 
     /** @param config ustawienia uruchomienia; ten sam obiekt dostają wszystkie wątki */
     public Crawler(CrawlerConfig config) {
+        this(config, new DBConn(config.dbPath()));
+    }
+
+    /**
+     * Tylko dla testów (pakietowo-prywatny): pozwala podstawić podklasę DBConn,
+     * która symuluje błędy. Sam obiekt DBConn nie otwiera jeszcze bazy.
+     */
+    Crawler(CrawlerConfig config, DBConn db) {
         this.config = config;
+        this.db = db;
     }
 
     /**
      * Uruchamia robota i blokuje do zakończenia pracy wszystkich wątków.
      * Połączenie z bazą jest zamykane także wtedy, gdy wystąpi błąd.
      *
-     * @throws DatabaseException gdy nie da się otworzyć lub przygotować bazy
+     * @throws DatabaseException gdy nie da się otworzyć lub przygotować bazy albo gdy
+     *                           baza przestała działać w trakcie pracy wątków
      */
     public Stats run() {
         long start = System.nanoTime();
-        DBConn db = new DBConn(config.dbPath());
         // Jeden licznik dla wszystkich wątków - limit maxPages dotyczy całego robota.
         AtomicInteger pagesFetched = new AtomicInteger();
+        // Pierwszy błąd bazy z któregokolwiek wątku. Wątek zapisuje go tutaj i kończy pracę,
+        // a my rzucamy go dalej dopiero, gdy wszystkie wątki się zatrzymają.
+        AtomicReference<DatabaseException> dbFailure = new AtomicReference<>();
         try {
             prepareDatabase(db);
 
@@ -64,13 +81,17 @@ public class Crawler {
             for (int i = 0; i < config.threads(); i++) {
                 // execute, a nie submit: przy submit wyjątek z wątku zostałby po cichu
                 // schowany w Future; tu JVM wypisze go razem z nazwą wątku.
-                pool.execute(new CrawlerThread(db, config, pagesFetched, stopRequested));
+                pool.execute(new CrawlerThread(db, config, pagesFetched, stopRequested, dbFailure));
             }
             // shutdown nie przerywa wątków - tylko zamyka pulę na nowe zadania,
             // dzięki czemu awaitTermination zwróci true, gdy wszystkie skończą pracę.
             pool.shutdown();
             waitForThreads(pool, pagesFetched);
 
+            if (dbFailure.get() != null) {
+                // Ten sam wyjątek, który dostał wątek - Main zamienia go na kod wyjścia 1.
+                throw dbFailure.get();
+            }
             if (stopRequested.get()) {
                 log("zatrzymano - niedokończone linki zostają w bazie do wznowienia");
             }
@@ -108,7 +129,11 @@ public class Crawler {
         }
     }
 
-    /** Czeka na koniec pracy wątków, co kilka sekund wypisując postęp. */
+    /**
+     * Czeka na koniec pracy wątków, co kilka sekund wypisując postęp. Wraca dopiero,
+     * gdy wątki skończyły (albo po przerwaniu minął limit czekania), bo zaraz potem
+     * run() zamyka bazę.
+     */
     private void waitForThreads(ExecutorService pool, AtomicInteger pagesFetched) {
         try {
             while (!pool.awaitTermination(PROGRESS_INTERVAL_SECONDS, TimeUnit.SECONDS)) {
@@ -119,6 +144,16 @@ public class Crawler {
             // na flagę przerwania) i przywracamy flagę, bo awaitTermination ją wyczyściło.
             log("przerwano - zatrzymywanie wątków");
             pool.shutdownNow();
+            // Przerwany wątek musi jeszcze oddać link (releaseLink), a finally w run() zaraz
+            // zamknie bazę. Czekamy najwyżej timeoutMs - dłużej wątek nie utknie w jednym żądaniu.
+            try {
+                if (!pool.awaitTermination(config.timeoutMs(), TimeUnit.MILLISECONDS)) {
+                    log("wątki nie zakończyły się w " + config.timeoutMs() + " ms - zamykanie bazy mimo to");
+                }
+            } catch (InterruptedException again) {
+                // Drugie przerwanie - nie czekamy dłużej; flagę i tak przywracamy niżej.
+            }
+            // Flagę przywracamy dopiero teraz: ustawiona wcześniej przerwałaby od razu awaitTermination.
             Thread.currentThread().interrupt();
         }
     }

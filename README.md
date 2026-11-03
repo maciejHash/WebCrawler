@@ -139,11 +139,11 @@ stateDiagram-v2
 | `NEW` | Znaleziony, czeka na odwiedzenie. Linki z `depth > maxDepth` zostają `NEW` na zawsze (albo do uruchomienia z większym `--max-depth`). |
 | `IN_PROGRESS` | Przejęty przez wątek (`claimed_by`), który właśnie go przetwarza. |
 | `VISITED` | Strona pobrana, linki z niej zapisane. |
-| `ERROR` | Żądanie się nie powiodło: kod HTTP 4xx/5xx, typ treści inny niż HTML/XML, przekroczony czas, błąd sieci. Opis w `error`. |
+| `ERROR` | Obsługa strony się nie powiodła: kod HTTP 4xx/5xx, typ treści inny niż HTML/XML, przekroczony czas, błąd sieci albo inny nieoczekiwany wyjątek (wtedy w `error` jest nazwa klasy i komunikat). Opis w `error`. |
 | `SKIPPED` | Pominięty bez żądania HTTP: inny host (bez `--all-hosts`) albo plik binarny po rozszerzeniu (`.pdf`, `.jpg`, `.zip`, ...). |
 
-Link wraca z `IN_PROGRESS` do `NEW`, gdy wątek oddaje go po wyczerpaniu limitu stron lub przerwaniu
-(`releaseLink`) albo przy starcie programu po przerwanym uruchomieniu (`resetInProgress`).
+Link wraca z `IN_PROGRESS` do `NEW`, gdy wątek oddaje go po wyczerpaniu limitu stron, przerwaniu
+lub błędzie bazy (`releaseLink`) albo przy starcie programu po przerwanym uruchomieniu (`resetInProgress`).
 
 ### Przydatne zapytania
 
@@ -174,10 +174,12 @@ flowchart TD
     fetch -- sukces --> extract["extractLinks()<br/>absUrl + UrlUtils.normalize"]
     extract --> insert["db.insertRow() dla każdego linku<br/>depth + 1"]
     insert --> visited["db.markVisited()"]
-    fetch -- "HTTP 4xx/5xx, timeout,<br/>zły typ, błąd sieci" --> error["db.markError()"]
+    fetch -- "HTTP 4xx/5xx, timeout, zły typ,<br/>błąd sieci, inny RuntimeException" --> error["db.markError()<br/>klasa + komunikat"]
     visited --> delay["sleep delayMs"]
     error --> delay
     delay --> stop
+    dberr(["DatabaseException<br/>w dowolnym kroku"]) --> dbstop["db.releaseLink() - błąd ignorowany<br/>zapisz pierwszy błąd dla Crawlera<br/>stopRequested = true"]
+    dbstop --> finish
 ```
 
 Kolejność „najpierw `insertRow`, potem `markVisited`” jest celowa: dopóki strona jest `IN_PROGRESS`,
@@ -186,7 +188,23 @@ Gdyby strona została oznaczona jako `VISITED` przed zapisaniem linków, pozosta
 zakończyć się w tej krótkiej chwili, zostawiając całą pracę jednemu wątkowi.
 
 Przerwanie wątku (np. `shutdownNow`) w trakcie pobierania oddaje link (`releaseLink`) - strona
-nie jest wadliwa, więc nie dostaje statusu `ERROR`.
+nie jest wadliwa, więc nie dostaje statusu `ERROR`. Dlatego `Crawler` po `shutdownNow()` czeka jeszcze
+na wątki (najwyżej limit czasu jednego żądania), zanim zamknie bazę - inaczej wątek trafiłby na zamknięte połączenie.
+
+### Wyjątki w wątku
+
+Wątek, który zginąłby od nieobsłużonego wyjątku, zostawiłby swój link `IN_PROGRESS` na zawsze, a pozostałe
+wątki widziałyby go w `hasPendingWork` i czekały bez końca. Dlatego są dwa rodzaje błędów:
+
+- **Błąd jednej strony** - każdy wyjątek przy pobieraniu, parsowaniu i zapisie linków tej strony
+  (wyjątki jsoup, `IOException`, dowolny `RuntimeException`) **poza** `DatabaseException`. Strona dostaje
+  status `ERROR` z nazwą klasy i komunikatem, a wątek bierze kolejny link.
+- **Błąd bazy** (`DatabaseException`) - dalsza praca nie ma sensu, bo każdy kolejny zapis też może się nie udać.
+  Wątek próbuje oddać link (`releaseLink`; jeśli i to się nie uda, link zostaje `IN_PROGRESS`, a przy następnym
+  starcie przywróci go `resetInProgress`), zapisuje pierwszy taki wyjątek we wspólnym
+  `AtomicReference<DatabaseException>`, ustawia `stopRequested` i kończy się. Pozostałe wątki zatrzymują się
+  łagodnie - jak po Ctrl+C. Gdy wszystkie skończą, `Crawler.run()` rzuca zapisany wyjątek, a `Main`
+  kończy program kodem 1.
 
 ## Jak unikamy wielokrotnych odwiedzin
 
@@ -287,6 +305,9 @@ SELECT EXISTS (
 
 Jedno zapytanie zamiast dwóch, bo dwa osobne mogłyby zobaczyć bazę w dwóch różnych chwilach.
 Jeśli praca jeszcze jest (inny wątek przetwarza stronę i może dodać linki), wątek czeka 200 ms.
+To czekanie zawsze się kończy, bo każdy link `IN_PROGRESS` dostaje status końcowy albo wraca do `NEW`
+także wtedy, gdy przy jego obsłudze poleci wyjątek (patrz [Wyjątki w wątku](#wyjątki-w-wątku)).
+Wątek kończy pracę również wtedy, gdy ustawiono `stopRequested` (Ctrl+C albo błąd bazy w dowolnym wątku).
 
 Limit `--max-pages` to jeden `AtomicInteger` wspólny dla wszystkich wątków. Miejsce jest rezerwowane
 przez `incrementAndGet()` tuż przed żądaniem HTTP - operacja atomowa, więc dokładnie `maxPages` wątków
@@ -309,6 +330,7 @@ lokalny `com.sun.net.httpserver.HttpServer` z JDK.
 | `DBConnConcurrencyTest` | 8 wątków przejmuje 200 linków - każdy link trafia do dokładnie jednego wątku (wspólne i osobne połączenia, test powtarzany). |
 | `CrawlerThreadRunTest` | Cała pętla `run()` na lokalnej stronie: statusy, `seen`, limit stron, zatrzymanie. |
 | `CrawlerTest`, `CrawlerEndToEndTest` | Cały robot z pulą wątków: każda strona pobrana dokładnie raz (licznik żądań po stronie serwera), cykle, duplikaty, 404, wznowienie. |
+| `CrawlerFailureTest` | Wyjątki w wątkach (podklasa `DBConn` rzucająca z `insertRow`): nieoczekiwany błąd strony daje `ERROR` i nie zawiesza robota, `DatabaseException` wychodzi z `Crawler.run()`, a link wraca do `NEW`. |
 | `MainTest` | Parsowanie argumentów, pomoc, tekst raportu. |
 
 GitHub Actions (`.github/workflows/ci.yml`) uruchamia `mvn -B verify` na JDK 27 przy każdym pushu
