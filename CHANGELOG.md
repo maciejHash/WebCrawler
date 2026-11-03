@@ -6,6 +6,8 @@ zmiany jeszcze niewydane są w sekcji „Niewydane”.
 
 ## [Niewydane]
 
+## [1.1.0] - 2026-11-03
+
 ### Dodane
 
 - Opcja `--version` - wypisuje `Web Crawler <wersja>` i kończy program kodem 0, także przy błędnych
@@ -55,5 +57,6 @@ Pierwsze wydanie.
 - Wykonywalny `target/web-crawler.jar` (maven-shade-plugin), CI w GitHub Actions, testy bez dostępu
   do internetu.
 
-[Niewydane]: https://github.com/maciejHash/WebCrawler/compare/v1.0.0...HEAD
+[Niewydane]: https://github.com/maciejHash/WebCrawler/compare/v1.1.0...HEAD
+[1.1.0]: https://github.com/maciejHash/WebCrawler/compare/v1.0.0...v1.1.0
 [1.0.0]: https://github.com/maciejHash/WebCrawler/releases/tag/v1.0.0
