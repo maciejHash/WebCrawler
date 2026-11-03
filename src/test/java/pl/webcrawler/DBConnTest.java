@@ -10,6 +10,10 @@ import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import java.nio.file.Path;
+import java.sql.Connection;
+import java.sql.DriverManager;
+import java.sql.SQLException;
+import java.sql.Statement;
 import java.util.Arrays;
 import java.util.List;
 import java.util.Map;
@@ -39,14 +43,6 @@ class DBConnTest {
     @AfterEach
     void tearDown() {
         db.disconnect();
-    }
-
-    @Test
-    void createTablesTwiceDoesNotThrowAndKeepsData() {
-        db.insertRow(URL, 0);
-
-        assertDoesNotThrow(db::createTables);
-        assertTrue(db.findByUrl(URL).isPresent());
     }
 
     @Test
@@ -115,19 +111,6 @@ class DBConnTest {
     }
 
     @Test
-    void dropTablesRemovesTable() {
-        db.insertRow(URL, 0);
-
-        db.dropTables();
-
-        // Brak tabeli → SQLite zgłasza błąd, który DBConn opakowuje w DatabaseException.
-        assertThrows(DatabaseException.class, () -> db.findByUrl(URL));
-        // Po ponownym utworzeniu tabela jest pusta.
-        db.createTables();
-        assertTrue(db.findByUrl(URL).isEmpty());
-    }
-
-    @Test
     void disconnectTwiceIsSafe() {
         db.disconnect();
         assertDoesNotThrow(db::disconnect);
@@ -137,6 +120,102 @@ class DBConnTest {
     void usingDatabaseWithoutConnectionFails() {
         db.disconnect();
         assertThrows(IllegalStateException.class, () -> db.insertRow(URL, 0));
+    }
+
+    // ---- wersje schematu ----
+
+    @Test
+    void newDatabaseGetsLatestSchemaVersion() {
+        try (DBConn fresh = new DBConn(tempDir.resolve("new.db").toString())) {
+            fresh.connect();
+            assertEquals(0, fresh.schemaVersion(), "pusty plik nie ma jeszcze żadnej migracji");
+
+            fresh.createTables();
+
+            assertEquals(DBConn.LATEST_SCHEMA_VERSION, fresh.schemaVersion());
+        }
+    }
+
+    @Test
+    void databaseFromProgramWithoutVersioningIsUpgradedAndKeepsData() throws SQLException {
+        // Tak bazę zostawiały wersje programu sprzed wersjonowania: tabela i indeks są,
+        // ale user_version nikt nie ustawił, więc wynosi 0.
+        Path file = tempDir.resolve("old.db");
+        executeRaw(file,
+                """
+                CREATE TABLE links (
+                    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                    url        TEXT    NOT NULL UNIQUE,
+                    depth      INTEGER NOT NULL,
+                    seen       INTEGER NOT NULL DEFAULT 1,
+                    status     TEXT    NOT NULL DEFAULT 'NEW',
+                    claimed_by TEXT,
+                    found_at   TEXT DEFAULT CURRENT_TIMESTAMP,
+                    visited_at TEXT,
+                    error      TEXT
+                )""",
+                "CREATE INDEX idx_links_status_depth ON links (status, depth)",
+                """
+                INSERT INTO links (url, depth, seen, status, claimed_by)
+                VALUES ('https://example.com/', 0, 3, 'VISITED', 'crawler-1')""",
+                "INSERT INTO links (url, depth) VALUES ('https://example.com/new', 1)");
+
+        try (DBConn old = new DBConn(file.toString())) {
+            old.connect();
+            assertEquals(0, old.schemaVersion());
+
+            old.createTables();
+
+            assertEquals(DBConn.LATEST_SCHEMA_VERSION, old.schemaVersion());
+            assertEquals(Map.of("VISITED", 1, "NEW", 1), old.countByStatus());
+            DBConn.LinkRow row = old.findByUrl("https://example.com/").orElseThrow();
+            assertEquals(3, row.seen());
+            assertEquals("crawler-1", row.claimedBy());
+            // Po migracji robot może dalej pracować na tych danych.
+            assertEquals("https://example.com/new", old.claimNextLink("w", 1).orElseThrow().url());
+        }
+    }
+
+    @Test
+    void createTablesTwiceKeepsDataAndVersion() {
+        db.insertRow(URL, 0);
+
+        assertDoesNotThrow(db::createTables);
+
+        assertEquals(DBConn.LATEST_SCHEMA_VERSION, db.schemaVersion());
+        assertEquals(1, db.findByUrl(URL).orElseThrow().seen());
+    }
+
+    @Test
+    void databaseFromNewerProgramIsRejected() throws SQLException {
+        Path file = tempDir.resolve("newer.db");
+        int newer = DBConn.LATEST_SCHEMA_VERSION + 1;
+        executeRaw(file, "PRAGMA user_version = " + newer);
+
+        try (DBConn other = new DBConn(file.toString())) {
+            other.connect();
+
+            DatabaseException e = assertThrows(DatabaseException.class, other::createTables);
+
+            assertTrue(e.getMessage().contains("nowszej wersji programu"), e.getMessage());
+            assertEquals(newer, other.schemaVersion(), "wersja bez zmian");
+            assertThrows(DatabaseException.class, other::countByStatus, "tabela nie powstała");
+        }
+    }
+
+    @Test
+    void dropTablesRemovesTableAndResetsVersion() {
+        db.insertRow(URL, 0);
+
+        db.dropTables();
+
+        assertEquals(0, db.schemaVersion());
+        // Brak tabeli → SQLite zgłasza błąd, który DBConn opakowuje w DatabaseException.
+        assertThrows(DatabaseException.class, () -> db.findByUrl(URL));
+        // Wersja 0, więc createTables() wykonuje migracje od nowa - tabela jest pusta.
+        db.createTables();
+        assertEquals(DBConn.LATEST_SCHEMA_VERSION, db.schemaVersion());
+        assertTrue(db.findByUrl(URL).isEmpty());
     }
 
     // ---- przejmowanie linków ----
@@ -459,6 +538,16 @@ class DBConnTest {
         LinkRecord link = db.claimNextLink("w", 0).orElseThrow();
         assertEquals(url, link.url());
         return link;
+    }
+
+    /** Wykonuje SQL przez zwykłe połączenie JDBC z pominięciem DBConn - jak inna wersja programu. */
+    private static void executeRaw(Path file, String... statements) throws SQLException {
+        try (Connection conn = DriverManager.getConnection("jdbc:sqlite:" + file);
+             Statement stmt = conn.createStatement()) {
+            for (String sql : statements) {
+                stmt.execute(sql);
+            }
+        }
     }
 
     @Test

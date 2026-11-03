@@ -6,6 +6,11 @@ package pl.webcrawler;
  */
 public class DatabaseException extends RuntimeException {
 
+    /** Błąd wykryty przez nasz kod (np. zła wersja schematu), a nie zgłoszony przez SQLite. */
+    public DatabaseException(String message) {
+        super(message);
+    }
+
     public DatabaseException(String message, Throwable cause) {
         super(message, cause);
     }

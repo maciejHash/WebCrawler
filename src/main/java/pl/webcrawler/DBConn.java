@@ -36,6 +36,27 @@ public class DBConn implements AutoCloseable {
     private static final String CREATE_INDEX =
             "CREATE INDEX IF NOT EXISTS idx_links_status_depth ON links (status, depth)";
 
+    /**
+     * Migracje schematu: element o indeksie i prowadzi bazę do wersji i + 1. Numer wersji
+     * jest zapisany w pliku bazy (PRAGMA user_version, nowa baza ma 0).
+     * Zmianę schematu dopisuje się jako nowy element na końcu listy. Istniejących migracji
+     * nie wolno zmieniać: bazy, które już je mają, nie wykonają ich drugi raz.
+     * Migracja 1 ma IF NOT EXISTS, bo wersje programu sprzed wersjonowania tworzyły tę samą
+     * tabelę i indeks, ale zostawiały user_version = 0 - na takiej bazie niczego nie zmienia.
+     */
+    private static final List<List<String>> MIGRATIONS = List.of(
+            List.of(CREATE_TABLE, CREATE_INDEX)     // 1: tabela links i indeks (status, depth)
+    );
+
+    /** Wersja schematu, do której createTables() doprowadza bazę: numer ostatniej migracji. */
+    public static final int LATEST_SCHEMA_VERSION = MIGRATIONS.size();
+
+    private static final String GET_SCHEMA_VERSION = "PRAGMA user_version";
+
+    // PRAGMA nie przyjmuje parametrów (?), więc numer doklejamy do tekstu. To bezpieczne:
+    // zawsze jest to int z naszego kodu, a nie dane z zewnątrz.
+    private static final String SET_SCHEMA_VERSION = "PRAGMA user_version = ";
+
     // Jedno zapytanie zamiast "SELECT, potem INSERT albo UPDATE": dzięki UNIQUE na url
     // baza sama rozstrzyga, czy link jest nowy, więc dwa wątki nie wstawią go podwójnie.
     // MIN(depth, ...) - jeśli link znaleziono krótszą drogą, zapamiętujemy mniejszą głębokość.
@@ -148,13 +169,42 @@ public class DBConn implements AutoCloseable {
         }
     }
 
-    /** Tworzy tabelę i indeks; bezpieczne przy ponownym wywołaniu dzięki IF NOT EXISTS. */
+    /**
+     * Doprowadza schemat do wersji {@link #LATEST_SCHEMA_VERSION}: wykonuje po kolei migracje,
+     * których baza jeszcze nie ma. Ponowne wywołanie nic nie robi.
+     * Każda migracja razem z nowym user_version to osobna transakcja - przerwanie programu
+     * nie zostawi migracji wykonanej w połowie ani numeru wersji niezgodnego ze schematem.
+     *
+     * @throws DatabaseException także wtedy, gdy baza ma wersję wyższą niż znana programowi
+     */
     public synchronized void createTables() {
-        try {
-            execute(CREATE_TABLE);
-            execute(CREATE_INDEX);
+        int version = schemaVersion();
+        if (version > LATEST_SCHEMA_VERSION) {
+            // Starszy program nie zna tabel i kolumn dodanych później - nie ruszamy takiej bazy.
+            throw new DatabaseException("Baza " + dbPath + " pochodzi z nowszej wersji programu"
+                    + " (wersja schematu " + version + ", ten program obsługuje najwyżej "
+                    + LATEST_SCHEMA_VERSION + ") - użyj nowszej wersji programu albo innego pliku bazy");
+        }
+        for (int next = version + 1; next <= LATEST_SCHEMA_VERSION; next++) {
+            List<String> statements = new ArrayList<>(MIGRATIONS.get(next - 1));
+            statements.add(SET_SCHEMA_VERSION + next);
+            try {
+                executeInTransaction(statements);
+            } catch (SQLException e) {
+                throw new DatabaseException("Nie można wykonać migracji schematu do wersji " + next, e);
+            }
+        }
+    }
+
+    /** Wersja schematu zapisana w pliku bazy (PRAGMA user_version); 0 - żadnej migracji. */
+    public synchronized int schemaVersion() {
+        try (PreparedStatement stmt = openConnection().prepareStatement(GET_SCHEMA_VERSION);
+             ResultSet rs = stmt.executeQuery()) {
+            // PRAGMA user_version zawsze zwraca dokładnie jeden wiersz z jedną liczbą.
+            rs.next();
+            return rs.getInt(1);
         } catch (SQLException e) {
-            throw new DatabaseException("Nie można utworzyć tabel", e);
+            throw new DatabaseException("Nie można odczytać wersji schematu bazy: " + dbPath, e);
         }
     }
 
@@ -356,10 +406,15 @@ public class DBConn implements AutoCloseable {
         }
     }
 
-    /** Usuwa tabelę (indeks znika razem z nią). */
+    /**
+     * Usuwa tabelę (indeks znika razem z nią) i zeruje wersję schematu, żeby createTables()
+     * wykonało wszystkie migracje od nowa. Oba kroki w jednej transakcji: gdyby program
+     * przerwał się pomiędzy nimi, baza miałaby wersję 1 bez tabeli, a createTables()
+     * uznałoby, że nie ma nic do zrobienia.
+     */
     public synchronized void dropTables() {
         try {
-            execute(DROP_TABLE);
+            executeInTransaction(List.of(DROP_TABLE, SET_SCHEMA_VERSION + 0));
         } catch (SQLException e) {
             throw new DatabaseException("Nie można usunąć tabel", e);
         }
@@ -390,6 +445,26 @@ public class DBConn implements AutoCloseable {
     private void execute(String sql) throws SQLException {
         try (PreparedStatement stmt = openConnection().prepareStatement(sql)) {
             stmt.execute();
+        }
+    }
+
+    /**
+     * Wykonuje polecenia bez parametrów w jednej transakcji: w bazie zostają wszystkie zmiany
+     * albo żadna. W SQLite transakcja obejmuje także DDL (CREATE, DROP) i PRAGMA user_version.
+     */
+    private void executeInTransaction(List<String> statements) throws SQLException {
+        Connection conn = openConnection();
+        conn.setAutoCommit(false);
+        try {
+            for (String sql : statements) {
+                execute(sql);
+            }
+            conn.commit();
+        } catch (SQLException e) {
+            rollback(conn, e);
+            throw e;
+        } finally {
+            restoreAutoCommit(conn);
         }
     }
 

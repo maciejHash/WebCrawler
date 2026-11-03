@@ -145,12 +145,33 @@ stateDiagram-v2
 Link wraca z `IN_PROGRESS` do `NEW`, gdy wątek oddaje go po wyczerpaniu limitu stron, przerwaniu
 lub błędzie bazy (`releaseLink`) albo przy starcie programu po przerwanym uruchomieniu (`resetInProgress`).
 
+### Wersje schematu
+
+Numer wersji schematu jest zapisany w samym pliku bazy (`PRAGMA user_version`; nowy plik ma 0).
+`DBConn.MIGRATIONS` to lista migracji - migracja na pozycji *n* (licząc od 1) prowadzi do wersji *n*.
+
+| Wersja | Zmiana |
+|---|---|
+| 0 | Pusty plik albo baza z wersji programu sprzed wersjonowania. |
+| 1 | Tabela `links` i indeks `idx_links_status_depth`. |
+
+`createTables()` odczytuje `user_version` i wykonuje po kolei brakujące migracje. Każda migracja razem
+z ustawieniem nowego `user_version` to osobna transakcja, więc przerwanie programu nie zostawi migracji
+wykonanej w połowie. Baza z wersją wyższą niż znana programowi (utworzona przez nowszą wersję) kończy
+się błędem `DatabaseException` - starszy program nie zna jej tabel i kolumn, więc jej nie zmienia.
+
+Migracja 1 używa `IF NOT EXISTS`: na bazie ze starszej wersji programu (tabela jest, `user_version = 0`)
+tylko ustawia wersję 1, a dane zostają. `dropTables()` (`--fresh`) usuwa tabelę i zeruje `user_version`
+w jednej transakcji. Zmianę schematu dodaje się jako nową migrację na końcu listy - istniejących się
+nie zmienia, bo bazy, które już je mają, nie wykonają ich drugi raz.
+
 ### Przydatne zapytania
 
 ```bash
 sqlite3 crawler.db "SELECT status, COUNT(*) FROM links GROUP BY status;"
 sqlite3 crawler.db "SELECT url, seen FROM links ORDER BY seen DESC LIMIT 10;"
 sqlite3 crawler.db "SELECT url, error FROM links WHERE status = 'ERROR';"
+sqlite3 crawler.db "PRAGMA user_version;"
 ```
 
 ## Pętla `CrawlerThread`
@@ -345,7 +366,7 @@ lokalny `com.sun.net.httpserver.HttpServer` z JDK.
 |---|---|
 | `UrlUtilsTest` | Normalizacja, porównywanie hostów, pliki binarne. |
 | `CrawlerThreadTest` | `extractLinks` na HTML z pamięci. |
-| `DBConnTest` | Każda metoda `DBConn` na pliku SQLite w katalogu tymczasowym. |
+| `DBConnTest` | Każda metoda `DBConn` na pliku SQLite w katalogu tymczasowym, w tym migracje schematu (nowa baza, baza sprzed wersjonowania, baza z nowszej wersji, `dropTables`). |
 | `DBConnConcurrencyTest` | 8 wątków przejmuje 200 linków - każdy link trafia do dokładnie jednego wątku (wspólne i osobne połączenia, test powtarzany). |
 | `CrawlerThreadRunTest` | Cała pętla `run()` na lokalnej stronie: statusy, `seen`, limit stron, zatrzymanie. |
 | `CrawlerTest`, `CrawlerEndToEndTest` | Cały robot z pulą wątków: każda strona pobrana dokładnie raz (licznik żądań po stronie serwera), cykle, duplikaty, 404, wznowienie. |
