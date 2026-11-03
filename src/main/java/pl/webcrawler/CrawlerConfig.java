@@ -28,8 +28,9 @@ public record CrawlerConfig(String startUrl, int threads, int maxPages, int maxD
     public static final boolean DEFAULT_FRESH = false;
     public static final int DEFAULT_TIMEOUT_MS = 10_000;
     public static final int DEFAULT_DELAY_MS = 500;
+    // Wersja z pom.xml, żeby administrator serwera wiedział, która wersja robota go odwiedza.
     // Tylko drukowalne ASCII - nagłówki HTTP nie powinny zawierać innych znaków (sprawdza konstruktor).
-    public static final String DEFAULT_USER_AGENT = "pl.webcrawler/1.0 (student project)";
+    public static final String DEFAULT_USER_AGENT = "pl.webcrawler/" + AppVersion.get() + " (student project)";
 
     /**
      * Sprawdza wartości od razu przy tworzeniu, żeby błąd w argumentach wyszedł na starcie,

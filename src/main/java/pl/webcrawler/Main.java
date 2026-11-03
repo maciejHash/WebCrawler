@@ -30,7 +30,12 @@ public class Main {
 
     /** Wydzielone z main, żeby test mógł sprawdzić treść bez przechwytywania System.out. */
     static String startMessage() {
-        return "Web Crawler - start (Java " + Runtime.version() + ")";
+        return "Web Crawler " + AppVersion.get() + " - start (Java " + Runtime.version() + ")";
+    }
+
+    /** Tekst wypisywany przez --version. */
+    static String versionMessage() {
+        return "Web Crawler " + AppVersion.get();
     }
 
     static String usage() {
@@ -51,6 +56,7 @@ public class Main {
                   --db plik         plik bazy SQLite (domyślnie %s)
                   --fresh           usuń dane z bazy i zacznij od nowa
                   -h, --help        wyświetl tę pomoc
+                  --version         wyświetl wersję programu
 
                 Wznawianie: bez --fresh robot kontynuuje pracę zapisaną w bazie - strony
                 już odwiedzone nie są pobierane ponownie, a linki przerwane w trakcie
@@ -72,6 +78,16 @@ public class Main {
     static boolean isHelpRequested(String[] args) {
         for (String arg : args) {
             if (arg.equals("--help") || arg.equals("-h")) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /** --version, tak jak --help, działa niezależnie od pozostałych (nawet błędnych) argumentów. */
+    static boolean isVersionRequested(String[] args) {
+        for (String arg : args) {
+            if (arg.equals("--version")) {
                 return true;
             }
         }
@@ -176,6 +192,10 @@ public class Main {
     public static void main(String[] args) {
         if (isHelpRequested(args)) {
             System.out.print(usage());
+            return;
+        }
+        if (isVersionRequested(args)) {
+            System.out.println(versionMessage());
             return;
         }
         CrawlerConfig config;

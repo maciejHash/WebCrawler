@@ -21,8 +21,37 @@ import org.junit.jupiter.params.provider.MethodSource;
 class MainTest {
 
     @Test
-    void startMessageNamesTheProgram() {
-        assertTrue(Main.startMessage().startsWith("Web Crawler"));
+    void startMessageShowsProgramAndJavaVersion() {
+        String message = Main.startMessage();
+
+        assertTrue(message.startsWith("Web Crawler " + AppVersion.get()), message);
+        assertTrue(message.contains("Java " + Runtime.version()), message);
+    }
+
+    @Test
+    void versionMessageShowsVersionFromPom() {
+        assertEquals("Web Crawler " + AppVersion.get(), Main.versionMessage());
+    }
+
+    @Test
+    void versionIsRecognizedEvenWithInvalidArguments() {
+        assertTrue(Main.isVersionRequested(new String[] {"--version"}));
+        assertTrue(Main.isVersionRequested(new String[] {"--threads", "abc", "--version"}));
+        assertTrue(Main.isVersionRequested(new String[] {"--foo", "--version", "ftp://x"}));
+        assertFalse(Main.isVersionRequested(new String[] {"https://example.com"}));
+        // --version nie jest zwykłą opcją, więc parseArgs ją odrzuca - main sprawdza ją wcześniej.
+        assertThrows(IllegalArgumentException.class,
+                () -> Main.parseArgs(new String[] {"https://example.com", "--version"}));
+    }
+
+    @Test
+    void defaultUserAgentContainsVersionAndIsValidAscii() {
+        String expected = "pl.webcrawler/" + AppVersion.get() + " (student project)";
+        assertEquals(expected, CrawlerConfig.DEFAULT_USER_AGENT);
+
+        // Konstruktor CrawlerConfig sprawdza znaki User-Agent - domyślna wartość musi przejść.
+        CrawlerConfig config = Main.parseArgs(new String[] {"https://example.com"});
+        assertEquals(expected, config.userAgent());
     }
 
     @Test
@@ -123,6 +152,7 @@ class MainTest {
         assertTrue(usage.contains("--delay"), usage);
         assertTrue(usage.contains("--timeout"), usage);
         assertTrue(usage.contains("--user-agent"), usage);
+        assertTrue(usage.contains("--version"), usage);
         assertTrue(usage.contains(CrawlerConfig.DEFAULT_USER_AGENT), usage);
         assertTrue(usage.contains("Wznawianie"), usage);
         assertTrue(usage.contains("java -jar"), usage);

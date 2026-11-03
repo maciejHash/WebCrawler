@@ -5,7 +5,7 @@
 
   <groupId>pl.webcrawler</groupId>
   <artifactId>webcrawler</artifactId>
-  <version>1.0-SNAPSHOT</version>
+  <version>1.1.0-SNAPSHOT</version>
   <packaging>jar</packaging>
 
   <name>webcrawler</name>
@@ -52,6 +52,26 @@
   </dependencies>
 
   <build>
+    <!-- Jedno źródło numeru wersji: <version> powyżej. Maven wstawia ją do pliku
+         webcrawler-version.properties, z którego czyta AppVersion. W odróżnieniu od manifestu
+         JAR-a działa to też w testach i w mvn exec:java. Filtrowanie tylko dla tego pliku,
+         żeby ${...} w innych zasobach nie zostały przypadkiem podmienione. -->
+    <resources>
+      <resource>
+        <directory>src/main/resources</directory>
+        <filtering>true</filtering>
+        <includes>
+          <include>webcrawler-version.properties</include>
+        </includes>
+      </resource>
+      <resource>
+        <directory>src/main/resources</directory>
+        <filtering>false</filtering>
+        <excludes>
+          <exclude>webcrawler-version.properties</exclude>
+        </excludes>
+      </resource>
+    </resources>
     <plugins>
       <plugin>
         <groupId>org.apache.maven.plugins</groupId>
@@ -132,6 +152,10 @@
                 <transformer implementation="org.apache.maven.plugins.shade.resource.ManifestResourceTransformer">
                   <manifestEntries>
                     <Main-Class>pl.webcrawler.Main</Main-Class>
+                    <!-- Wersja widoczna też w samym JAR-ze (np. unzip -p ... META-INF/MANIFEST.MF);
+                         program czyta ją z webcrawler-version.properties -->
+                    <Implementation-Title>${project.name}</Implementation-Title>
+                    <Implementation-Version>${project.version}</Implementation-Version>
                     <!-- Odpowiednik opcji JVM enable-native-access=ALL-UNNAMED dla java -jar:
                          sqlite-jdbc ładuje bibliotekę natywną, a bez tego JDK wypisuje ostrzeżenie -->
                     <Enable-Native-Access>ALL-UNNAMED</Enable-Native-Access>

@@ -31,6 +31,7 @@ Kompiluje kod, uruchamia testy i buduje wykonywalny plik `target/web-crawler.jar
 ```bash
 java -jar target/web-crawler.jar https://books.toscrape.com --threads 4 --max-pages 50
 java -jar target/web-crawler.jar --help
+java -jar target/web-crawler.jar --version
 ```
 
 Alternatywnie, bez budowania JAR-a:
@@ -49,11 +50,12 @@ mvn -q compile exec:java -Dexec.args="https://books.toscrape.com --max-pages 20"
 | `--max-depth N` | `3` | Maksymalna głębokość; strona startowa ma 0, linki z niej 1 itd. (`N >= 0`). |
 | `--delay MS` | `500` | Przerwa po każdym żądaniu (także nieudanym), żeby nie przeciążać serwera; `0` = bez przerwy. Przerwę robi każdy wątek osobno. |
 | `--timeout MS` | `10000` | Limit czasu jednego żądania HTTP w milisekundach (`MS >= 1`). Strona, która nie odpowie w tym czasie, dostaje status `ERROR`. Od tej wartości zależy też, jak długo Ctrl+C czeka na zakończenie wątków. |
-| `--user-agent TEKST` | `pl.webcrawler/1.0 (student project)` | Nagłówek `User-Agent` wysyłany z każdym żądaniem. Niepusty, tylko drukowalne znaki ASCII (od spacji do `~`) - polskie litery, tabulator czy znak nowej linii kończą program błędem. Wartość ze spacjami trzeba ująć w cudzysłów. |
+| `--user-agent TEKST` | `pl.webcrawler/<wersja> (student project)` | Nagłówek `User-Agent` wysyłany z każdym żądaniem. Niepusty, tylko drukowalne znaki ASCII (od spacji do `~`) - polskie litery, tabulator czy znak nowej linii kończą program błędem. Wartość ze spacjami trzeba ująć w cudzysłów. |
 | `--all-hosts` | wyłączone | Odwiedzaj też strony z innych hostów. Domyślnie tylko host startowy (`www.` i wielkość liter są pomijane). Linki do innych hostów i tak trafiają do bazy, a po przejęciu przez wątek dostają status `SKIPPED`. |
 | `--db plik` | `crawler.db` | Plik bazy SQLite. |
 | `--fresh` | wyłączone | Usuwa dane z bazy i zaczyna od nowa. Bez tej flagi robot wznawia pracę zapisaną w bazie. |
 | `-h`, `--help` | | Wyświetla pomoc (działa nawet przy błędnych pozostałych argumentach). |
+| `--version` | | Wypisuje `Web Crawler <wersja>` i kończy program kodem 0 (też przy błędnych pozostałych argumentach). |
 
 Każda opcja może wystąpić najwyżej raz. Błędne argumenty kończą program kodem 2, błąd bazy kodem 1.
 
@@ -82,6 +84,7 @@ Wszystkie klasy są w pakiecie `pl.webcrawler`.
 | `CrawlerThread` | `Runnable` - pętla: przejmij link → pobierz stronę → wyciągnij linki → zapisz je → oznacz stronę. |
 | `DBConn` | Cały SQL; jedna instancja współdzielona przez wątki, metody publiczne `synchronized`. |
 | `LinkRecord` | Record `(id, url, depth)` - link przejęty przez wątek. |
+| `AppVersion` | Wersja programu wczytana z `webcrawler-version.properties` (wartość zapasowa `dev`). |
 | `UrlUtils` | Normalizacja adresów, porównywanie hostów, rozpoznawanie plików binarnych. |
 | `DatabaseException` | Niekontrolowany wyjątek opakowujący `SQLException`. |
 
@@ -370,10 +373,28 @@ lokalny `com.sun.net.httpserver.HttpServer` z JDK.
 | `CrawlerThreadRunTest` | Cała pętla `run()` na lokalnej stronie: statusy, `seen`, limit stron, zatrzymanie. |
 | `CrawlerTest`, `CrawlerEndToEndTest` | Cały robot z pulą wątków: każda strona pobrana dokładnie raz (licznik żądań po stronie serwera), cykle, duplikaty, 404, wznowienie. |
 | `CrawlerFailureTest` | Wyjątki w wątkach (podklasa `DBConn` rzucająca z `saveVisitedPage`): nieoczekiwany błąd strony daje `ERROR` i nie zawiesza robota, `DatabaseException` wychodzi z `Crawler.run()`, a link wraca do `NEW`. |
-| `MainTest` | Parsowanie argumentów (w tym granice `--timeout` i znaki w `--user-agent`), pomoc, tekst raportu. |
+| `MainTest` | Parsowanie argumentów (w tym granice `--timeout` i znaki w `--user-agent`), pomoc, `--version`, wersja w komunikacie startowym i domyślnym User-Agent, tekst raportu. |
+| `AppVersionTest` | Wersja z przefiltrowanego zasobu; `dev`, gdy pliku brak albo nie był filtrowany. |
 
 GitHub Actions (`.github/workflows/ci.yml`) uruchamia `mvn -B verify` na JDK 27 przy każdym pushu
 do `main` i każdym pull requeście, a gotowy `web-crawler.jar` zapisuje jako artefakt.
+
+## Wersje i wydania
+
+Numer wersji jest w jednym miejscu - `<version>` w `pom.xml`. Przy budowaniu Maven wstawia go
+(filtrowanie zasobów) do `src/main/resources/webcrawler-version.properties`, skąd czyta go klasa
+`AppVersion`. Dzięki temu wersja jest ta sama w `--version`, komunikacie startowym, domyślnym
+`User-Agent` i manifeście JAR-a (`Implementation-Version`) - także w testach i w `mvn exec:java`.
+Program uruchomiony bez Mavena (np. sama kompilacja w IDE) pokazuje wersję `dev`.
+
+- Numeracja według [Semantic Versioning](https://semver.org/lang/pl/): `MAJOR.MINOR.PATCH`.
+  MAJOR - zmiany niezgodne wstecz (np. opcje wiersza poleceń, schemat bazy bez migracji),
+  MINOR - nowe funkcje zgodne wstecz, PATCH - poprawki błędów.
+  W trakcie prac wersja ma przyrostek `-SNAPSHOT` (np. `1.1.0-SNAPSHOT`).
+- Wydanie: ustaw w `pom.xml` wersję bez `-SNAPSHOT`, opisz zmiany w `CHANGELOG.md`,
+  zrób commit i oznacz go tagiem `vX.Y.Z` (np. `git tag v1.1.0`), a potem przestaw `pom.xml`
+  na kolejną wersję `-SNAPSHOT`.
+- `CHANGELOG.md` zawiera listę zmian dla każdego wydania, od najnowszego.
 
 ## Ograniczenia
 
