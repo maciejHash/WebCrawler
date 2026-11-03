@@ -28,7 +28,7 @@ public record CrawlerConfig(String startUrl, int threads, int maxPages, int maxD
     public static final boolean DEFAULT_FRESH = false;
     public static final int DEFAULT_TIMEOUT_MS = 10_000;
     public static final int DEFAULT_DELAY_MS = 500;
-    // Tylko ASCII - nagłówki HTTP nie powinny zawierać innych znaków.
+    // Tylko drukowalne ASCII - nagłówki HTTP nie powinny zawierać innych znaków (sprawdza konstruktor).
     public static final String DEFAULT_USER_AGENT = "pl.webcrawler/1.0 (student project)";
 
     /**
@@ -53,6 +53,24 @@ public record CrawlerConfig(String startUrl, int threads, int maxPages, int maxD
         }
         if (userAgent == null || userAgent.isBlank()) {
             throw new IllegalArgumentException("Brak User-Agent");
+        }
+        requirePrintableAscii(userAgent);
+    }
+
+    /**
+     * Nagłówki HTTP powinny zawierać tylko drukowalne ASCII. Znak nowej linii pozwoliłby
+     * dopisać do żądania własny nagłówek, a polskie litery biblioteka HTTP mogłaby
+     * zakodować różnie albo odrzucić dopiero przy pierwszym żądaniu - lepiej zgłosić to na starcie.
+     */
+    private static void requirePrintableAscii(String userAgent) {
+        for (int i = 0; i < userAgent.length(); i++) {
+            char c = userAgent.charAt(i);
+            if (c < ' ' || c > '~') {
+                throw new IllegalArgumentException(String.format(
+                        "User-Agent może zawierać tylko drukowalne znaki ASCII (od spacji do ~),"
+                                + " niedozwolony znak U+%04X na pozycji %d",
+                        userAgent.codePointAt(i), i + 1));
+            }
         }
     }
 

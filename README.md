@@ -48,15 +48,14 @@ mvn -q compile exec:java -Dexec.args="https://books.toscrape.com --max-pages 20"
 | `--max-pages N` | `100` | Wspólny dla wszystkich wątków limit stron pobranych **w tym uruchomieniu** (`N >= 1`). |
 | `--max-depth N` | `3` | Maksymalna głębokość; strona startowa ma 0, linki z niej 1 itd. (`N >= 0`). |
 | `--delay MS` | `500` | Przerwa po każdym żądaniu (także nieudanym), żeby nie przeciążać serwera; `0` = bez przerwy. Przerwę robi każdy wątek osobno. |
+| `--timeout MS` | `10000` | Limit czasu jednego żądania HTTP w milisekundach (`MS >= 1`). Strona, która nie odpowie w tym czasie, dostaje status `ERROR`. Od tej wartości zależy też, jak długo Ctrl+C czeka na zakończenie wątków. |
+| `--user-agent TEKST` | `pl.webcrawler/1.0 (student project)` | Nagłówek `User-Agent` wysyłany z każdym żądaniem. Niepusty, tylko drukowalne znaki ASCII (od spacji do `~`) - polskie litery, tabulator czy znak nowej linii kończą program błędem. Wartość ze spacjami trzeba ująć w cudzysłów. |
 | `--all-hosts` | wyłączone | Odwiedzaj też strony z innych hostów. Domyślnie tylko host startowy (`www.` i wielkość liter są pomijane). Linki do innych hostów i tak trafiają do bazy, a po przejęciu przez wątek dostają status `SKIPPED`. |
 | `--db plik` | `crawler.db` | Plik bazy SQLite. |
 | `--fresh` | wyłączone | Usuwa dane z bazy i zaczyna od nowa. Bez tej flagi robot wznawia pracę zapisaną w bazie. |
 | `-h`, `--help` | | Wyświetla pomoc (działa nawet przy błędnych pozostałych argumentach). |
 
 Każda opcja może wystąpić najwyżej raz. Błędne argumenty kończą program kodem 2, błąd bazy kodem 1.
-
-Z wiersza poleceń nie da się ustawić limitu czasu żądania (10 000 ms) ani nagłówka
-`User-Agent` (`pl.webcrawler/1.0 (student project)`) - są stałymi w `CrawlerConfig`.
 
 ### Wznawianie i Ctrl+C
 
@@ -371,7 +370,7 @@ lokalny `com.sun.net.httpserver.HttpServer` z JDK.
 | `CrawlerThreadRunTest` | Cała pętla `run()` na lokalnej stronie: statusy, `seen`, limit stron, zatrzymanie. |
 | `CrawlerTest`, `CrawlerEndToEndTest` | Cały robot z pulą wątków: każda strona pobrana dokładnie raz (licznik żądań po stronie serwera), cykle, duplikaty, 404, wznowienie. |
 | `CrawlerFailureTest` | Wyjątki w wątkach (podklasa `DBConn` rzucająca z `saveVisitedPage`): nieoczekiwany błąd strony daje `ERROR` i nie zawiesza robota, `DatabaseException` wychodzi z `Crawler.run()`, a link wraca do `NEW`. |
-| `MainTest` | Parsowanie argumentów, pomoc, tekst raportu. |
+| `MainTest` | Parsowanie argumentów (w tym granice `--timeout` i znaki w `--user-agent`), pomoc, tekst raportu. |
 
 GitHub Actions (`.github/workflows/ci.yml`) uruchamia `mvn -B verify` na JDK 27 przy każdym pushu
 do `main` i każdym pull requeście, a gotowy `web-crawler.jar` zapisuje jako artefakt.
@@ -390,7 +389,6 @@ do `main` i każdym pull requeście, a gotowy `web-crawler.jar` zapisuje jako ar
   wąskim gardłem jest sieć, ale przy dziesiątkach wątków byłaby nim baza.
 - **Domeny IDN** (z polskimi znakami w nazwie hosta) są odrzucane.
 - `www.` jest pomijane przy porównywaniu hostów, ale inne subdomeny (`blog.example.com`) to już inny host.
-- Limit czasu żądania i `User-Agent` nie są ustawiane z wiersza poleceń.
 
 ## Pomysły na rozwój
 
@@ -399,6 +397,5 @@ do `main` i każdym pull requeście, a gotowy `web-crawler.jar` zapisuje jako ar
 - Zapisywanie adresu docelowego po przekierowaniu i `rel="canonical"`, żeby wykrywać kolejne duplikaty.
 - Ponawianie stron z błędem przejściowym (timeout, HTTP 5xx) z ograniczoną liczbą prób.
 - Kolejność odwiedzin według głębokości (`ORDER BY depth, id`) - ścisłe przeszukiwanie wszerz.
-- Opcje `--timeout` i `--user-agent` w wierszu poleceń.
 - Odczyt `sitemap.xml` jako dodatkowego źródła linków.
 - Eksport wyników (CSV, graf linków między stronami - wymagałby tabeli krawędzi).

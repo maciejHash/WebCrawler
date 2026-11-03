@@ -26,7 +26,7 @@ public class Main {
     static final List<String> STATUSES = List.of("NEW", "IN_PROGRESS", "VISITED", "ERROR", "SKIPPED");
 
     private static final Set<String> OPTIONS_WITH_VALUE =
-            Set.of("--threads", "--max-pages", "--max-depth", "--db", "--delay");
+            Set.of("--threads", "--max-pages", "--max-depth", "--db", "--delay", "--timeout", "--user-agent");
 
     /** Wydzielone z main, żeby test mógł sprawdzić treść bez przechwytywania System.out. */
     static String startMessage() {
@@ -43,6 +43,10 @@ public class Main {
                   --max-depth N     maksymalna głębokość, strona startowa ma 0 (domyślnie %d)
                   --delay MS        przerwa po każdym żądaniu w milisekundach, żeby nie
                                     przeciążać serwera (domyślnie %d, 0 = bez przerwy)
+                  --timeout MS      limit czasu jednego żądania w milisekundach (domyślnie %d)
+                  --user-agent TEKST
+                                    nagłówek User-Agent, tylko drukowalne znaki ASCII
+                                    (domyślnie "%s")
                   --all-hosts       odwiedzaj też inne hosty (domyślnie tylko host startowy)
                   --db plik         plik bazy SQLite (domyślnie %s)
                   --fresh           usuń dane z bazy i zacznij od nowa
@@ -56,8 +60,11 @@ public class Main {
                 Przykłady:
                   java -jar target/web-crawler.jar https://books.toscrape.com --threads 4 --max-pages 50
                   java -jar target/web-crawler.jar https://books.toscrape.com --fresh --delay 1000
+                  java -jar target/web-crawler.jar https://books.toscrape.com --timeout 3000 \\
+                      --user-agent "MojRobot/1.0 (+https://example.com/bot)"
                 """.formatted(CrawlerConfig.DEFAULT_THREADS, CrawlerConfig.DEFAULT_MAX_PAGES,
                 CrawlerConfig.DEFAULT_MAX_DEPTH, CrawlerConfig.DEFAULT_DELAY_MS,
+                CrawlerConfig.DEFAULT_TIMEOUT_MS, CrawlerConfig.DEFAULT_USER_AGENT,
                 CrawlerConfig.DEFAULT_DB_PATH);
     }
 
@@ -72,8 +79,9 @@ public class Main {
     }
 
     /**
-     * Zamienia argumenty na konfigurację. Pola, których nie da się ustawić z wiersza
-     * poleceń (timeout, User-Agent), dostają wartości domyślne.
+     * Zamienia argumenty na konfigurację. Opcje pominięte dostają wartości domyślne
+     * z {@link CrawlerConfig}; tam też jest walidacja niezależna od wiersza poleceń
+     * (adres startowy, znaki w User-Agent).
      *
      * @throws IllegalArgumentException z komunikatem do pokazania użytkownikowi
      */
@@ -83,6 +91,8 @@ public class Main {
         int maxPages = CrawlerConfig.DEFAULT_MAX_PAGES;
         int maxDepth = CrawlerConfig.DEFAULT_MAX_DEPTH;
         int delayMs = CrawlerConfig.DEFAULT_DELAY_MS;
+        int timeoutMs = CrawlerConfig.DEFAULT_TIMEOUT_MS;
+        String userAgent = CrawlerConfig.DEFAULT_USER_AGENT;
         boolean sameHostOnly = CrawlerConfig.DEFAULT_SAME_HOST_ONLY;
         boolean fresh = CrawlerConfig.DEFAULT_FRESH;
         String dbPath = CrawlerConfig.DEFAULT_DB_PATH;
@@ -121,15 +131,17 @@ public class Main {
                 case "--max-pages" -> maxPages = intValue(arg, value, 1);
                 case "--max-depth" -> maxDepth = intValue(arg, value, 0);
                 case "--delay" -> delayMs = intValue(arg, value, 0);
+                case "--timeout" -> timeoutMs = intValue(arg, value, 1);
                 case "--db" -> dbPath = value;
+                case "--user-agent" -> userAgent = value;
             }
         }
         if (startUrl == null) {
             throw new IllegalArgumentException("Brak adresu startowego");
         }
-        // Adres sprawdza i normalizuje konstruktor CrawlerConfig.
+        // Adres i User-Agent sprawdza konstruktor CrawlerConfig.
         return new CrawlerConfig(startUrl, threads, maxPages, maxDepth, sameHostOnly, dbPath, fresh,
-                CrawlerConfig.DEFAULT_TIMEOUT_MS, delayMs, CrawlerConfig.DEFAULT_USER_AGENT);
+                timeoutMs, delayMs, userAgent);
     }
 
     /** Wartość opcji stojącej na pozycji optionIndex, czyli następny argument. */
@@ -219,7 +231,9 @@ public class Main {
         // Najgorszy przypadek: wątek właśnie zaczął pobierać stronę (timeout), a potem
         // odczeka przerwę (delay). Gdyby i tak nie zdążył, linki IN_PROGRESS wrócą
         // do NEW przy następnym uruchomieniu (resetInProgress).
-        long waitMs = config.timeoutMs() + config.delayMs() + SHUTDOWN_MARGIN_MS;
+        // Rzutowanie na long przed dodawaniem: suma dwóch dużych int-ów (np. --timeout
+        // i --delay bliskie 2^31) przekroczyłaby zakres int i dała czas ujemny.
+        long waitMs = (long) config.timeoutMs() + config.delayMs() + SHUTDOWN_MARGIN_MS;
         try {
             if (!finished.await(waitMs, TimeUnit.MILLISECONDS)) {
                 log("wątki nie zakończyły się w " + waitMs + " ms - wyjście bez raportu");

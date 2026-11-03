@@ -9,10 +9,13 @@ import java.time.Duration;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.stream.Stream;
 
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.Arguments;
 import org.junit.jupiter.params.provider.CsvSource;
+import org.junit.jupiter.params.provider.MethodSource;
 
 /** Parsowanie argumentów wiersza poleceń, pomoc i tekst raportu. */
 class MainTest {
@@ -34,6 +37,8 @@ class MainTest {
         assertEquals(CrawlerConfig.DEFAULT_SAME_HOST_ONLY, config.sameHostOnly());
         assertEquals(CrawlerConfig.DEFAULT_DB_PATH, config.dbPath());
         assertEquals(CrawlerConfig.DEFAULT_DELAY_MS, config.delayMs());
+        assertEquals(CrawlerConfig.DEFAULT_TIMEOUT_MS, config.timeoutMs());
+        assertEquals(CrawlerConfig.DEFAULT_USER_AGENT, config.userAgent());
         assertFalse(config.fresh(), "domyślnie wznawiamy poprzednią pracę");
     }
 
@@ -42,7 +47,9 @@ class MainTest {
         CrawlerConfig config = Main.parseArgs(new String[] {
                 "--threads", "8", "--all-hosts", "https://example.com/start",
                 "--max-pages", "50", "--max-depth", "0", "--db", "out.db",
-                "--fresh", "--delay", "0"});
+                "--fresh", "--delay", "0", "--timeout", "2500",
+                // Jeden argument ze spacjami - tak przekaże go powłoka dla wartości w cudzysłowie.
+                "--user-agent", "MojRobot/2.0 (+https://example.com/bot)"});
 
         assertEquals("https://example.com/start", config.startUrl());
         assertEquals(8, config.threads());
@@ -52,6 +59,53 @@ class MainTest {
         assertEquals("out.db", config.dbPath());
         assertTrue(config.fresh());
         assertEquals(0, config.delayMs());
+        assertEquals(2500, config.timeoutMs());
+        assertEquals("MojRobot/2.0 (+https://example.com/bot)", config.userAgent());
+    }
+
+    @Test
+    void timeoutAcceptsMinimalValue() {
+        CrawlerConfig config = Main.parseArgs(new String[] {"https://a.pl", "--timeout", "1"});
+
+        assertEquals(1, config.timeoutMs());
+    }
+
+    @Test
+    void userAgentAcceptsWholePrintableAsciiRange() {
+        // Wszystkie znaki od spacji (0x20) do tyldy (0x7E) - granice zakresu z CrawlerConfig.
+        StringBuilder userAgent = new StringBuilder("Robot");
+        for (char c = ' '; c <= '~'; c++) {
+            userAgent.append(c);
+        }
+
+        CrawlerConfig config = Main.parseArgs(
+                new String[] {"https://a.pl", "--user-agent", userAgent.toString()});
+
+        assertEquals(userAgent.toString(), config.userAgent());
+    }
+
+    /** User-Agent → fragment oczekiwanego komunikatu. Znaki sterujące wpisane jako zwykłe literały Javy. */
+    static Stream<Arguments> invalidUserAgents() {
+        return Stream.of(
+                Arguments.of("", "Brak User-Agent"),
+                Arguments.of("   ", "Brak User-Agent"),
+                Arguments.of("Robot-ł", "niedozwolony znak U+0142 na pozycji 7"),
+                Arguments.of("Robot\u00a0x", "niedozwolony znak U+00A0"),       // twarda spacja
+                Arguments.of("Robot\tx", "niedozwolony znak U+0009"),
+                Arguments.of("Robot\r\nX-Evil: 1", "niedozwolony znak U+000D"), // próba dopisania nagłówka
+                Arguments.of("Robot\u007f", "niedozwolony znak U+007F"),         // DEL, tuż za tyldą
+                Arguments.of("Robot \uD83D\uDE00", "niedozwolony znak U+1F600")); // emoji
+    }
+
+    @ParameterizedTest
+    @MethodSource("invalidUserAgents")
+    void invalidUserAgentIsRejected(String userAgent, String expectedFragment) {
+        String[] args = {"https://a.pl", "--user-agent", userAgent};
+
+        IllegalArgumentException e = assertThrows(IllegalArgumentException.class,
+                () -> Main.parseArgs(args));
+        assertTrue(e.getMessage().contains(expectedFragment),
+                "komunikat: \"" + e.getMessage() + "\", oczekiwano fragmentu: \"" + expectedFragment + "\"");
     }
 
     @Test
@@ -67,6 +121,9 @@ class MainTest {
 
         assertTrue(usage.contains("--fresh"), usage);
         assertTrue(usage.contains("--delay"), usage);
+        assertTrue(usage.contains("--timeout"), usage);
+        assertTrue(usage.contains("--user-agent"), usage);
+        assertTrue(usage.contains(CrawlerConfig.DEFAULT_USER_AGENT), usage);
         assertTrue(usage.contains("Wznawianie"), usage);
         assertTrue(usage.contains("java -jar"), usage);
     }
@@ -98,6 +155,15 @@ class MainTest {
             https://a.pl --delay                           | Brak wartości po --delay
             https://a.pl --delay -1                        | --delay: wartość musi być >= 0, podano: -1
             https://a.pl --delay 1s                        | --delay: oczekiwano liczby całkowitej, podano: 1s
+            https://a.pl --timeout                         | Brak wartości po --timeout
+            https://a.pl --timeout --fresh                 | Brak wartości po --timeout
+            https://a.pl --timeout 0                       | --timeout: wartość musi być >= 1, podano: 0
+            https://a.pl --timeout -500                    | --timeout: wartość musi być >= 1, podano: -500
+            https://a.pl --timeout 5s                      | --timeout: oczekiwano liczby całkowitej, podano: 5s
+            https://a.pl --timeout 1000 --timeout 2000     | Opcja --timeout podana więcej niż raz
+            https://a.pl --user-agent                      | Brak wartości po --user-agent
+            https://a.pl --user-agent --fresh              | Brak wartości po --user-agent
+            https://a.pl --user-agent A --user-agent B     | Opcja --user-agent podana więcej niż raz
             ftp://example.com                              | Niepoprawny adres startowy
             """)
     void invalidArgumentsGiveReadableMessage(String argsLine, String expectedFragment) {
