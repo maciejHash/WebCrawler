@@ -90,13 +90,17 @@ public class DBConn implements AutoCloseable {
             GROUP BY claimed_by
             ORDER BY LENGTH(claimed_by), claimed_by""";
 
-    // Kandydaci do przejęcia: najstarsze (najmniejsze id) linki NEW w dozwolonej głębokości.
+    // Kandydaci do przejęcia: linki NEW w dozwolonej głębokości, najpierw najpłytsze, a przy
+    // równej głębokości najstarsze (najmniejsze id) - przeszukiwanie wszerz. Depth jest czytane
+    // przy każdym SELECT-cie, więc link, któremu UPSERT zmniejszył depth, od razu przesuwa się
+    // w kolejce. Indeks (status, depth) przechowuje wpisy w kolejności (depth, rowid), a id
+    // to rowid - SQLite czyta je w tej kolejności i nie musi sortować.
     // Pobieramy kilku naraz, żeby po przegranym wyścigu nie robić od razu nowego SELECT-a.
     private static final int CLAIM_BATCH = 20;
     private static final String SELECT_CANDIDATES = """
             SELECT id, url, depth FROM links
             WHERE status = 'NEW' AND depth <= ?
-            ORDER BY id
+            ORDER BY depth, id
             LIMIT ?""";
 
     // Serce ochrony przed podwójnymi odwiedzinami. Warunek status='NEW' sprawdza baza
@@ -281,7 +285,9 @@ public class DBConn implements AutoCloseable {
     }
 
     /**
-     * Przejmuje najstarszy link NEW o głębokości do maxDepth i zapisuje, kto go wziął.
+     * Przejmuje link NEW o głębokości do maxDepth i zapisuje, kto go wziął. Kolejność to
+     * przeszukiwanie wszerz: najmniejsza aktualna głębokość (także zmniejszona później
+     * przez UPSERT), a przy równej głębokości najstarszy link (najmniejsze id).
      * Link należy do wątku tylko wtedy, gdy warunkowy UPDATE zmienił wiersz; przy 0
      * (link właśnie przejęło inne połączenie) próbujemy kolejnego kandydata.
      */

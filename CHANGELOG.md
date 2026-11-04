@@ -6,6 +6,13 @@ zmiany jeszcze niewydane są w sekcji „Niewydane”.
 
 ## [Niewydane]
 
+### Zmienione
+
+- Wątki przejmują linki w kolejności wszerz: najpierw najbliższe strony startowej (najmniejsze `depth`),
+  a przy równej głębokości najstarsze (`ORDER BY depth, id` zamiast `ORDER BY id`). Link znaleziony później
+  krótszą drogą przesuwa się w kolejce, a przy limicie `--max-pages` pobierane są najpierw strony najbliższe
+  startowej. Kolejność wynika z istniejącego indeksu `(status, depth)` bez sortowania - schemat bazy bez zmian.
+
 ## [1.1.0] - 2026-11-03
 
 ### Dodane

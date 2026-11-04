@@ -221,7 +221,7 @@ class DBConnTest {
     // ---- przejmowanie linków ----
 
     @Test
-    void claimTakesOldestNewLinkAndStoresWorker() {
+    void claimPrefersOlderLinkAtEqualDepthAndStoresWorker() {
         db.insertRow(URL + "a", 0);
         db.insertRow(URL + "b", 0);
 
@@ -233,6 +233,33 @@ class DBConnTest {
         assertEquals(claimed.id(), row.id());
         assertEquals("IN_PROGRESS", row.status());
         assertEquals("worker-1", row.claimedBy());
+    }
+
+    @Test
+    void shallowerLinkAddedLaterIsClaimedBeforeOlderDeeperOne() {
+        db.insertRow(URL + "deep", 2);
+        db.insertRow(URL + "shallow", 1);
+        // Przy ORDER BY id pierwszy byłby "deep" - ma mniejsze id.
+        assertTrue(db.findByUrl(URL + "deep").orElseThrow().id()
+                < db.findByUrl(URL + "shallow").orElseThrow().id());
+
+        assertEquals(URL + "shallow", db.claimNextLink("w", 5).orElseThrow().url());
+        assertEquals(URL + "deep", db.claimNextLink("w", 5).orElseThrow().url());
+    }
+
+    @Test
+    void linkWhoseDepthDecreasedMovesUpTheQueue() {
+        db.insertRow(URL + "older", 2);
+        db.insertRow(URL + "later", 3);
+        // "later" znaleziony krótszą drogą: UPSERT ustawia depth = MIN(3, 1) = 1,
+        // więc wyprzedza "older", choć wcześniej był za nim (większe depth i id).
+        db.insertRow(URL + "later", 1);
+
+        LinkRecord first = db.claimNextLink("w", 5).orElseThrow();
+
+        assertEquals(URL + "later", first.url());
+        assertEquals(1, first.depth(), "wątek dostaje aktualną, zmniejszoną głębokość");
+        assertEquals(URL + "older", db.claimNextLink("w", 5).orElseThrow().url());
     }
 
     @Test

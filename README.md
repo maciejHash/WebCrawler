@@ -112,7 +112,7 @@ CREATE INDEX IF NOT EXISTS idx_links_status_depth ON links (status, depth);
 
 | Kolumna | Znaczenie |
 |---|---|
-| `id` | Klucz; kolejność znalezienia linku. Wątki biorą linki od najmniejszego `id`. |
+| `id` | Klucz; kolejność znalezienia linku. Wątki biorą najpierw linki o najmniejszym `depth`, a przy równej głębokości - od najmniejszego `id`. |
 | `url` | Znormalizowany adres (`UrlUtils.normalize`). `UNIQUE` - każdy adres występuje raz. |
 | `depth` | Najmniejsza znana głębokość (odległość od strony startowej w kliknięciach). |
 | `seen` | Ile razy link znaleziono na odwiedzonych stronach (każde wystąpienie, także na tej samej stronie). |
@@ -122,7 +122,8 @@ CREATE INDEX IF NOT EXISTS idx_links_status_depth ON links (status, depth);
 | `visited_at` | Kiedy link otrzymał status końcowy (UTC). |
 | `error` | Opis błędu dla statusu `ERROR`, np. `HTTP 404`. |
 
-Indeks na `(status, depth)` przyspiesza najczęstsze zapytanie: „daj linki `NEW` o głębokości do `maxDepth`”.
+Indeks na `(status, depth)` przyspiesza najczęstsze zapytanie: „daj linki `NEW` o głębokości do `maxDepth`,
+od najpłytszych” - i od razu podaje je w tej kolejności (patrz [punkt 2](#2-przejęcie-linku-warunkowym-update)).
 
 ### Statusy
 
@@ -257,10 +258,10 @@ INSERT OR IGNORE INTO links (url, depth) VALUES (?, 0)
 ### 2. Przejęcie linku warunkowym `UPDATE`
 
 ```sql
--- kandydaci: najstarsze linki NEW w dozwolonej głębokości (po 20 naraz)
+-- kandydaci: linki NEW w dozwolonej głębokości, najpierw najpłytsze (po 20 naraz)
 SELECT id, url, depth FROM links
 WHERE status = 'NEW' AND depth <= ?
-ORDER BY id
+ORDER BY depth, id
 LIMIT ?;
 
 -- próba przejęcia jednego kandydata
@@ -275,6 +276,20 @@ a po wyczerpaniu listy pobiera nową.
 
 Wynik `SELECT`-a jest wczytywany do listy i zamykany przed pierwszym `UPDATE`-em - otwarty odczyt
 trzymałby w SQLite stary obraz bazy i zapis mógłby się nie udać (`SQLITE_BUSY`).
+
+Kolejność kandydatów to przeszukiwanie wszerz: najpierw linki najbliżej strony startowej (najmniejsze `depth`),
+a przy równej głębokości najstarsze (najmniejsze `id`). Głębokość jest odczytywana przy każdym przejęciu,
+więc link, któremu UPSERT zmniejszył `depth` (`MIN(depth, ...)` z punktu 1), od razu przesuwa się w kolejce.
+Przy limicie `--max-pages` robot pobiera więc najpierw strony najbliższe startowej. Kolejność nie ma wpływu
+na ochronę przed podwójnymi odwiedzinami - o tym, do kogo należy link, decyduje warunkowy `UPDATE`.
+
+Sortowanie nic nie kosztuje: wpisy indeksu `(status, depth)` są uporządkowane po `depth`, a potem po `rowid`,
+którym w tej tabeli jest `id`. `EXPLAIN QUERY PLAN` pokazuje samo wyszukiwanie w indeksie, bez kroku
+`USE TEMP B-TREE FOR ORDER BY`:
+
+```
+SEARCH links USING INDEX idx_links_status_depth (status=? AND depth<?)
+```
 
 ### 3. Jedno współdzielone połączenie, metody `synchronized`
 
@@ -368,7 +383,7 @@ lokalny `com.sun.net.httpserver.HttpServer` z JDK.
 |---|---|
 | `UrlUtilsTest` | Normalizacja, porównywanie hostów, pliki binarne. |
 | `CrawlerThreadTest` | `extractLinks` na HTML z pamięci. |
-| `DBConnTest` | Każda metoda `DBConn` na pliku SQLite w katalogu tymczasowym, w tym migracje schematu (nowa baza, baza sprzed wersjonowania, baza z nowszej wersji, `dropTables`). |
+| `DBConnTest` | Każda metoda `DBConn` na pliku SQLite w katalogu tymczasowym, w tym kolejność przejmowania (najpłytsze linki pierwsze, także po zmniejszeniu `depth`) i migracje schematu (nowa baza, baza sprzed wersjonowania, baza z nowszej wersji, `dropTables`). |
 | `DBConnConcurrencyTest` | 8 wątków przejmuje 200 linków - każdy link trafia do dokładnie jednego wątku (wspólne i osobne połączenia, test powtarzany). |
 | `CrawlerThreadRunTest` | Cała pętla `run()` na lokalnej stronie: statusy, `seen`, limit stron, zatrzymanie. |
 | `CrawlerTest`, `CrawlerEndToEndTest` | Cały robot z pulą wątków: każda strona pobrana dokładnie raz (licznik żądań po stronie serwera), cykle, duplikaty, 404, wznowienie. |
@@ -406,6 +421,10 @@ Program uruchomiony bez Mavena (np. sama kompilacja w IDE) pokazuje wersję `dev
 - **Przerwa `--delay` jest na wątek, nie na serwer** - przy 4 wątkach serwer dostaje do 4 żądań w czasie jednej przerwy.
 - **Pliki binarne rozpoznawane po rozszerzeniu.** `/pobierz.php?f=a.pdf` zostanie pobrany; jsoup odrzuci go
   dopiero po nagłówku `Content-Type` (status `ERROR`).
+- **Kolejność wszerz przy kilku wątkach.** Wątek bierze najpłytszy link `NEW` dostępny w chwili przejęcia,
+  ale nie czeka, aż inne wątki skończą płytsze strony. Strona, która jest jeszcze `IN_PROGRESS`, może znaleźć
+  krótszą drogę do strony już odwiedzonej - jej `depth` zmaleje, ale linki zapisane z niej wcześniej zachowają
+  większą głębokość i przy `--max-depth` mogą nie zostać odwiedzone. Przy `--threads 1` kolejność jest ściśle wszerz.
 - **Jedno połączenie z bazą** - wszystkie operacje na bazie są wykonywane po kolei. Przy kilku wątkach
   wąskim gardłem jest sieć, ale przy dziesiątkach wątków byłaby nim baza.
 - **Domeny IDN** (z polskimi znakami w nazwie hosta) są odrzucane.
@@ -417,6 +436,5 @@ Program uruchomiony bez Mavena (np. sama kompilacja w IDE) pokazuje wersję `dev
 - Wspólny limit tempa na host zamiast przerwy w każdym wątku.
 - Zapisywanie adresu docelowego po przekierowaniu i `rel="canonical"`, żeby wykrywać kolejne duplikaty.
 - Ponawianie stron z błędem przejściowym (timeout, HTTP 5xx) z ograniczoną liczbą prób.
-- Kolejność odwiedzin według głębokości (`ORDER BY depth, id`) - ścisłe przeszukiwanie wszerz.
 - Odczyt `sitemap.xml` jako dodatkowego źródła linków.
 - Eksport wyników (CSV, graf linków między stronami - wymagałby tabeli krawędzi).
