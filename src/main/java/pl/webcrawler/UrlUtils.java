@@ -130,6 +130,18 @@ public final class UrlUtils {
         return BINARY_EXTENSIONS.contains(lastSegment.substring(dot + 1));
     }
 
+    /**
+     * Ścieżka razem z query stringiem, bez dekodowania {@code %XX}, np. {@code /szukaj?q=a}
+     * dla {@code https://example.com/szukaj?q=a} - to tę część robots.txt porównuje ze swoimi regułami.
+     *
+     * @param normalizedUrl adres po {@link #normalize} (ma ścieżkę co najmniej {@code /})
+     */
+    public static String pathWithQuery(String normalizedUrl) {
+        URI uri = URI.create(normalizedUrl);
+        String query = uri.getRawQuery();
+        return query == null ? uri.getRawPath() : uri.getRawPath() + "?" + query;
+    }
+
     /** Host małymi literami, bez "www."; pusty dla niepoprawnego adresu. */
     private static Optional<String> hostWithoutWww(String url) {
         // normalize() gwarantuje poprawny adres z hostem małymi literami

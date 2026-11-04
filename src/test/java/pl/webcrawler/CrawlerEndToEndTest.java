@@ -40,6 +40,7 @@ import com.sun.net.httpserver.HttpServer;
  * Cykle: / ↔ /about, /blog ↔ /blog/post1 ↔ /blog/post2 → / itd.
  * Link do innego hosta wskazuje ten sam serwer (localhost zamiast 127.0.0.1), więc gdyby
  * robot go pobrał, licznik żądań by to pokazał. To samo dotyczy pliku .pdf.
+ * /robots.txt to {@link #robotsTxt} albo 404, gdy null (domyślnie).
  */
 @Timeout(30)
 class CrawlerEndToEndTest {
@@ -53,9 +54,14 @@ class CrawlerEndToEndTest {
     private ExecutorService serverPool;
     private String base;
     private String externalUrl;
-    /** Ścieżka → treść HTML; ścieżki spoza mapy dostają 404. */
+    /**
+     * Ścieżka → treść HTML; ścieżki spoza mapy dostają 404. ConcurrentHashMap, bo test może
+     * podmienić stronę, a czytają ją wątki serwera.
+     */
     private Map<String, String> site;
-    /** Ścieżka → liczba żądań, także dla 404 i ścieżek, których robot nie powinien pobrać. */
+    /** Treść /robots.txt; null - serwer odpowiada 404. */
+    private volatile String robotsTxt;
+    /** Ścieżka → liczba żądań, także dla 404, /robots.txt i ścieżek, których robot nie powinien pobrać. */
     private final Map<String, AtomicInteger> requests = new ConcurrentHashMap<>();
 
     @BeforeEach
@@ -64,7 +70,7 @@ class CrawlerEndToEndTest {
         int port = server.getAddress().getPort();
         base = "http://127.0.0.1:" + port;
         externalUrl = "http://localhost:" + port + "/external";
-        site = buildSite();
+        site = new ConcurrentHashMap<>(buildSite());
 
         serverPool = Executors.newFixedThreadPool(THREADS);
         server.setExecutor(serverPool);
@@ -115,15 +121,36 @@ class CrawlerEndToEndTest {
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
         }
+        if (path.equals("/robots.txt")) {
+            String rules = robotsTxt;
+            respond(exchange, rules != null ? 200 : 404, "text/plain", rules != null ? rules : "");
+            return;
+        }
         String body = site.get(path);
         int status = body != null ? 200 : 404;
-        byte[] bytes = ("<html><body>" + (body != null ? body : "Nie ma takiej strony")
-                + "</body></html>").getBytes(StandardCharsets.UTF_8);
-        exchange.getResponseHeaders().set("Content-Type", "text/html; charset=utf-8");
+        respond(exchange, status, "text/html",
+                "<html><body>" + (body != null ? body : "Nie ma takiej strony") + "</body></html>");
+    }
+
+    private static void respond(HttpExchange exchange, int status, String type, String body) throws IOException {
+        byte[] bytes = body.getBytes(StandardCharsets.UTF_8);
+        exchange.getResponseHeaders().set("Content-Type", type + "; charset=utf-8");
         exchange.sendResponseHeaders(status, bytes.length);
         try (OutputStream out = exchange.getResponseBody()) {
             out.write(bytes);
         }
+    }
+
+    private CrawlerConfig config(boolean respectRobots) {
+        return new CrawlerConfig(base + "/", THREADS, 100, 10, true,
+                tempDir.resolve("crawl.db").toString(), false, 2_000, 0, "test-agent", respectRobots);
+    }
+
+    /** Osobne połączenie do sprawdzenia bazy - Crawler zamyka swoje po zakończeniu. */
+    private DBConn openDb() {
+        DBConn db = new DBConn(tempDir.resolve("crawl.db").toString());
+        db.connect();
+        return db;
     }
 
     /**
@@ -150,7 +177,7 @@ class CrawlerEndToEndTest {
     void crawlsWholeSiteOnceAndRecordsEveryLink() {
         String dbPath = tempDir.resolve("crawl.db").toString();
         CrawlerConfig config = new CrawlerConfig(base + "/", THREADS, 100, 10, true,
-                dbPath, false, 2_000, 0, "test-agent");
+                dbPath, false, 2_000, 0, "test-agent", true);
 
         Crawler.Stats stats = new Crawler(config).run();
 
@@ -159,10 +186,14 @@ class CrawlerEndToEndTest {
             assertEquals(1, requestCount(path), "liczba żądań dla " + path);
         }
         assertEquals(1, requestCount("/missing"), "liczba żądań dla /missing");
-        assertEquals(site.size() + 1, requests.size(), "żądane ścieżki: " + requests.keySet());
+        // robots.txt (tu 404 - wszystko wolno) raz mimo 4 wątków.
+        assertEquals(1, requestCount("/robots.txt"), "liczba żądań dla /robots.txt");
+        // + /missing i /robots.txt
+        assertEquals(site.size() + 2, requests.size(), "żądane ścieżki: " + requests.keySet());
         // Pominięte linki nie wygenerowały żadnego żądania.
         assertEquals(0, requestCount("/files/report.pdf"));
         assertEquals(0, requestCount("/external"));
+        // robots.txt nie liczy się do pobranych stron.
         assertEquals(site.size() + 1, stats.pagesFetched());
 
         // Wszystkie linki są w bazie (żadnych wierszy z #fragmentem ani mailto:),
@@ -190,6 +221,86 @@ class CrawlerEndToEndTest {
             assertEquals("SKIPPED", db.findByUrl(base + "/files/report.pdf").orElseThrow().status());
             assertEquals("SKIPPED", db.findByUrl(externalUrl).orElseThrow().status());
             assertTrue(db.findByUrl(base + "/about#team").isEmpty(), "fragment musi zostać usunięty");
+            assertTrue(db.findByUrl(base + "/robots.txt").isEmpty(), "robots.txt nie trafia do tabeli links");
+        }
+    }
+
+    private static final String DISALLOW_BLOG_POSTS = """
+            User-agent: *
+            Disallow: /blog/
+            """;
+
+    @Test
+    void pathDisallowedByRobotsTxtIsSkippedWithoutRequest() {
+        robotsTxt = DISALLOW_BLOG_POSTS;
+
+        Crawler.Stats stats = new Crawler(config(true)).run();
+
+        // "/blog/" z ukośnikiem: sama strona /blog jest dozwolona, wpisy pod nią - nie.
+        assertEquals(1, requestCount("/blog"));
+        assertEquals(0, requestCount("/blog/post1"), "zabroniona strona nie może zostać pobrana");
+        assertEquals(0, requestCount("/blog/post2"), "zabroniona strona nie może zostać pobrana");
+        assertEquals(1, requestCount("/robots.txt"));
+        // Zabronione strony nie zajęły miejsca w limicie: 5 stron + /missing.
+        assertEquals(site.size() - 2 + 1, stats.pagesFetched());
+        // SKIPPED: dwa wpisy (robots.txt), plik .pdf i obcy host.
+        assertEquals(Map.of("VISITED", site.size() - 2, "ERROR", 1, "SKIPPED", 4), stats.countByStatus());
+
+        try (DBConn db = openDb()) {
+            for (String path : new String[] {"/blog/post1", "/blog/post2"}) {
+                DBConn.LinkRow row = db.findByUrl(base + path).orElseThrow();
+                assertEquals("SKIPPED", row.status(), path);
+                assertEquals("robots.txt", row.error(), path);
+            }
+            // Pominięte z innych powodów nie mają opisu - po nim widać, co zablokował robots.txt.
+            assertNull(db.findByUrl(base + "/files/report.pdf").orElseThrow().error());
+        }
+    }
+
+    @Test
+    void ignoreRobotsVisitsDisallowedPathWithoutFetchingRobotsTxt() {
+        robotsTxt = DISALLOW_BLOG_POSTS;
+
+        Crawler.Stats stats = new Crawler(config(false)).run();
+
+        assertEquals(0, requestCount("/robots.txt"), "z --ignore-robots robots.txt nie jest pobierany");
+        assertEquals(1, requestCount("/blog/post1"));
+        assertEquals(1, requestCount("/blog/post2"));
+        assertEquals(Map.of("VISITED", site.size(), "ERROR", 1, "SKIPPED", 2), stats.countByStatus());
+        try (DBConn db = openDb()) {
+            assertEquals("VISITED", db.findByUrl(base + "/blog/post1").orElseThrow().status());
+        }
+    }
+
+    @Test
+    void robotsTxtDisallowingEverythingSkipsStartPage() {
+        robotsTxt = "User-agent: *\nDisallow: /\n";
+
+        Crawler.Stats stats = new Crawler(config(true)).run();
+
+        // Wątki kończą pracę normalnie, a jedynym żądaniem jest robots.txt.
+        assertEquals(1, requestCount("/robots.txt"));
+        assertEquals(1, requests.size(), "żądane ścieżki: " + requests.keySet());
+        assertEquals(0, stats.pagesFetched());
+        assertEquals(Map.of("SKIPPED", 1), stats.countByStatus());
+    }
+
+    @Test
+    void pageWithMetaNofollowIsVisitedButAddsNoLinks() {
+        // /about jako jedyna linkuje do obcego hosta; /team jest też linkowana z /blog/post2.
+        site.put("/about", "<meta name=\"robots\" content=\"noindex, nofollow\">" + site.get("/about"));
+
+        new Crawler(config(true)).run();
+
+        try (DBConn db = openDb()) {
+            assertEquals("VISITED", db.findByUrl(base + "/about").orElseThrow().status());
+            assertTrue(db.findByUrl(externalUrl).isEmpty(), "link ze strony nofollow trafił do bazy");
+            // Bez /about zostaje tylko wystąpienie na /blog/post2 (normalnie seen = 2).
+            assertEquals(1, db.findByUrl(base + "/team").orElseThrow().seen());
+        }
+        // Reszta witryny osiągalna innymi drogami - każda strona pobrana raz.
+        for (String path : site.keySet()) {
+            assertEquals(1, requestCount(path), "liczba żądań dla " + path);
         }
     }
 

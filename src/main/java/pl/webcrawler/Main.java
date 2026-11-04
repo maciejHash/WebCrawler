@@ -53,6 +53,9 @@ public class Main {
                                     nagłówek User-Agent, tylko drukowalne znaki ASCII
                                     (domyślnie "%s")
                   --all-hosts       odwiedzaj też inne hosty (domyślnie tylko host startowy)
+                  --ignore-robots   nie pobieraj robots.txt i odwiedzaj też strony, których
+                                    zabrania (domyślnie robots.txt jest respektowany,
+                                    a meta tag robots nofollow - zawsze)
                   --db plik         plik bazy SQLite (domyślnie %s)
                   --fresh           usuń dane z bazy i zacznij od nowa
                   -h, --help        wyświetl tę pomoc
@@ -111,6 +114,7 @@ public class Main {
         String userAgent = CrawlerConfig.DEFAULT_USER_AGENT;
         boolean sameHostOnly = CrawlerConfig.DEFAULT_SAME_HOST_ONLY;
         boolean fresh = CrawlerConfig.DEFAULT_FRESH;
+        boolean respectRobots = CrawlerConfig.DEFAULT_RESPECT_ROBOTS;
         String dbPath = CrawlerConfig.DEFAULT_DB_PATH;
 
         Set<String> usedOptions = new HashSet<>();
@@ -137,6 +141,10 @@ public class Main {
                 fresh = true;
                 continue;
             }
+            if (arg.equals("--ignore-robots")) {
+                respectRobots = false;
+                continue;
+            }
             if (!OPTIONS_WITH_VALUE.contains(arg)) {
                 throw new IllegalArgumentException("Nieznana opcja: " + arg);
             }
@@ -157,7 +165,7 @@ public class Main {
         }
         // Adres i User-Agent sprawdza konstruktor CrawlerConfig.
         return new CrawlerConfig(startUrl, threads, maxPages, maxDepth, sameHostOnly, dbPath, fresh,
-                timeoutMs, delayMs, userAgent);
+                timeoutMs, delayMs, userAgent, respectRobots);
     }
 
     /** Wartość opcji stojącej na pozycji optionIndex, czyli następny argument. */
@@ -248,12 +256,7 @@ public class Main {
         }
         log("zatrzymywanie - wątki kończą bieżące strony...");
         crawler.requestStop();
-        // Najgorszy przypadek: wątek właśnie zaczął pobierać stronę (timeout), a potem
-        // odczeka przerwę (delay). Gdyby i tak nie zdążył, linki IN_PROGRESS wrócą
-        // do NEW przy następnym uruchomieniu (resetInProgress).
-        // Rzutowanie na long przed dodawaniem: suma dwóch dużych int-ów (np. --timeout
-        // i --delay bliskie 2^31) przekroczyłaby zakres int i dała czas ujemny.
-        long waitMs = (long) config.timeoutMs() + config.delayMs() + SHUTDOWN_MARGIN_MS;
+        long waitMs = shutdownWaitMs(config);
         try {
             if (!finished.await(waitMs, TimeUnit.MILLISECONDS)) {
                 log("wątki nie zakończyły się w " + waitMs + " ms - wyjście bez raportu");
@@ -261,6 +264,21 @@ public class Main {
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
         }
+    }
+
+    /**
+     * Ile shutdown hook czeka na wątki. Najgorszy przypadek: wątek właśnie przejął link, pobiera
+     * robots.txt hosta (timeout), potem stronę (drugi timeout) i odczekuje przerwę - dłuższą
+     * z --delay i Crawl-delay, który wynosi najwyżej MAX_CRAWL_DELAY_MS. Gdyby i tak nie zdążył,
+     * linki IN_PROGRESS wrócą do NEW przy następnym uruchomieniu (resetInProgress).
+     * Liczymy na long: suma dużych int-ów (np. --timeout bliskie 2^31) dałaby czas ujemny.
+     */
+    static long shutdownWaitMs(CrawlerConfig config) {
+        if (!config.respectRobots()) {
+            return (long) config.timeoutMs() + config.delayMs() + SHUTDOWN_MARGIN_MS;
+        }
+        long maxPause = Math.max(config.delayMs(), CrawlerConfig.MAX_CRAWL_DELAY_MS);
+        return 2L * config.timeoutMs() + maxPause + SHUTDOWN_MARGIN_MS;
     }
 
     static String report(Crawler.Stats stats) {

@@ -49,6 +49,8 @@ class CrawlerTest {
     /** Ścieżka → liczba żądań; najważniejsza asercja: każda wartość równa 1. */
     private final Map<String, AtomicInteger> requests = new ConcurrentHashMap<>();
     private final AtomicInteger totalRequests = new AtomicInteger();
+    /** Żądania /robots.txt - liczone osobno, bo requests i totalRequests dotyczą stron. */
+    private final AtomicInteger robotsRequests = new AtomicInteger();
     /** Jeśli ustawiony, serwer woła na nim requestStop() przy trzecim żądaniu - jak Ctrl+C w trakcie pracy. */
     private volatile Crawler stopOnThirdRequest;
 
@@ -76,10 +78,15 @@ class CrawlerTest {
 
     private void handle(HttpExchange exchange) throws IOException {
         String path = exchange.getRequestURI().getPath();
-        requests.computeIfAbsent(path, p -> new AtomicInteger()).incrementAndGet();
-        Crawler toStop = stopOnThirdRequest;
-        if (totalRequests.incrementAndGet() == 3 && toStop != null) {
-            toStop.requestStop();
+        if (path.equals("/robots.txt")) {
+            // Odpowiedź jak dla każdej nieznanej ścieżki (pusta strona) - bez reguł, więc wszystko wolno.
+            robotsRequests.incrementAndGet();
+        } else {
+            requests.computeIfAbsent(path, p -> new AtomicInteger()).incrementAndGet();
+            Crawler toStop = stopOnThirdRequest;
+            if (totalRequests.incrementAndGet() == 3 && toStop != null) {
+                toStop.requestStop();
+            }
         }
         StringBuilder html = new StringBuilder("<html><body>");
         for (int k = 0; k < PAGES; k++) {
@@ -113,7 +120,7 @@ class CrawlerTest {
 
     private CrawlerConfig config(int maxPages, boolean fresh) {
         return new CrawlerConfig(base + "/", THREADS, maxPages, 20, true,
-                tempDir.resolve("crawl.db").toString(), fresh, 2_000, 0, "test-agent");
+                tempDir.resolve("crawl.db").toString(), fresh, 2_000, 0, "test-agent", true);
     }
 
     /** Osobne połączenie do sprawdzenia bazy - Crawler zamyka swoje po zakończeniu. */
@@ -136,6 +143,7 @@ class CrawlerTest {
         Crawler.Stats stats = new Crawler(config(100)).run();
 
         assertEachPageRequestedOnce();
+        assertEquals(1, robotsRequests.get(), "robots.txt pobrany raz mimo " + THREADS + " wątków");
         assertEquals(PAGES, stats.pagesFetched());
         assertEquals(Map.of("VISITED", PAGES), stats.countByStatus());
         assertFalse(stats.duration().isNegative());

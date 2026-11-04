@@ -118,4 +118,17 @@ class UrlUtilsTest {
     void doesNotFlagPagesAsBinary(String url) {
         assertFalse(UrlUtils.looksLikeBinaryFile(url));
     }
+
+    @ParameterizedTest(name = "{0} -> {1}")
+    @CsvSource(delimiter = '|', textBlock = """
+            https://example.com/                     | /
+            https://example.com/a/b.html             | /a/b.html
+            https://example.com/szukaj?q=java&p=2    | /szukaj?q=java&p=2
+            http://example.com:8080/x?               | /x?
+            # bez dekodowania %XX - tak samo jak w bazie
+            https://example.com/moja%20strona?q=%C5%82 | /moja%20strona?q=%C5%82
+            """)
+    void pathWithQueryIsComparedWithRobotsRules(String normalizedUrl, String expected) {
+        assertEquals(expected, UrlUtils.pathWithQuery(normalizedUrl));
+    }
 }

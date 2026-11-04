@@ -8,7 +8,8 @@ Wielowątkowy robot internetowy w Javie, który przegląda strony WWW i zapisuje
 - każdy wątek sam pobiera z bazy nieodwiedzone linki,
 - wszystkie linki ze strony trafiają do bazy, a powtórne znalezienie zwiększa licznik `seen`,
 - żadna strona nie jest pobierana dwa razy - pilnuje tego baza danych,
-- przerwaną pracę można wznowić, bo cały stan jest w pliku bazy.
+- przerwaną pracę można wznowić, bo cały stan jest w pliku bazy,
+- respektuje `robots.txt` (w tym `Crawl-delay`) i meta tag `robots` z `nofollow`.
 
 ## Wymagania
 
@@ -48,10 +49,11 @@ mvn -q compile exec:java -Dexec.args="https://books.toscrape.com --max-pages 20"
 | `--threads N` | `4` | Liczba wątków w puli (`N >= 1`). |
 | `--max-pages N` | `100` | Wspólny dla wszystkich wątków limit stron pobranych **w tym uruchomieniu** (`N >= 1`). |
 | `--max-depth N` | `3` | Maksymalna głębokość; strona startowa ma 0, linki z niej 1 itd. (`N >= 0`). |
-| `--delay MS` | `500` | Przerwa po każdym żądaniu (także nieudanym), żeby nie przeciążać serwera; `0` = bez przerwy. Przerwę robi każdy wątek osobno. |
+| `--delay MS` | `500` | Przerwa po każdym żądaniu (także nieudanym), żeby nie przeciążać serwera; `0` = bez przerwy. Przerwę robi każdy wątek osobno. Gdy `robots.txt` hosta podaje dłuższy `Crawl-delay`, obowiązuje on (najwyżej 10 s) - patrz [Crawl-delay](#crawl-delay). |
 | `--timeout MS` | `10000` | Limit czasu jednego żądania HTTP w milisekundach (`MS >= 1`). Strona, która nie odpowie w tym czasie, dostaje status `ERROR`. Od tej wartości zależy też, jak długo Ctrl+C czeka na zakończenie wątków. |
 | `--user-agent TEKST` | `pl.webcrawler/<wersja> (student project)` | Nagłówek `User-Agent` wysyłany z każdym żądaniem. Niepusty, tylko drukowalne znaki ASCII (od spacji do `~`) - polskie litery, tabulator czy znak nowej linii kończą program błędem. Wartość ze spacjami trzeba ująć w cudzysłów. |
 | `--all-hosts` | wyłączone | Odwiedzaj też strony z innych hostów. Domyślnie tylko host startowy (`www.` i wielkość liter są pomijane). Linki do innych hostów i tak trafiają do bazy, a po przejęciu przez wątek dostają status `SKIPPED`. |
+| `--ignore-robots` | wyłączone | Nie pobiera `robots.txt` i odwiedza także strony, których zabrania; `Crawl-delay` też nie obowiązuje. Meta tag `robots` z `nofollow` jest respektowany zawsze. Patrz [robots.txt](#robotstxt). |
 | `--db plik` | `crawler.db` | Plik bazy SQLite. |
 | `--fresh` | wyłączone | Usuwa dane z bazy i zaczyna od nowa. Bez tej flagi robot wznawia pracę zapisaną w bazie. |
 | `-h`, `--help` | | Wyświetla pomoc (działa nawet przy błędnych pozostałych argumentach). |
@@ -64,13 +66,102 @@ Każda opcja może wystąpić najwyżej raz. Błędne argumenty kończą program
 - Bez `--fresh` robot kontynuuje poprzednią pracę: strony `VISITED`, `ERROR` i `SKIPPED` nie są pobierane
   ponownie, linki `NEW` czekają w kolejce, a linki `IN_PROGRESS` (przerwane w trakcie) wracają do `NEW`.
 - Ctrl+C zatrzymuje robota łagodnie: wątki kończą bieżące strony, wypisywany jest raport,
-  a nieodwiedzone linki czekają na następne uruchomienie.
+  a nieodwiedzone linki czekają na następne uruchomienie. Program czeka na wątki najwyżej
+  2 × `--timeout` (`robots.txt` i strona) + dłuższa z wartości `--delay` i 10 s (`Crawl-delay`) + 5 s;
+  z `--ignore-robots` - `--timeout` + `--delay` + 5 s.
 - Limit `--max-pages` liczy strony tylko z bieżącego uruchomienia, więc można wznawiać pracę porcjami.
 
 ### Raport
 
 Na końcu program wypisuje raport: liczbę linków w każdym statusie, 10 najczęściej
 znajdowanych linków, liczbę stron pobranych przez każdy wątek i czas trwania.
+
+## robots.txt
+
+Domyślnie robot respektuje `robots.txt` - plik, w którym właściciel serwisu opisuje, czego roboty
+nie powinny pobierać. Obsługa to uproszczona wersja [RFC 9309](https://www.rfc-editor.org/rfc/rfc9309).
+`--ignore-robots` wyłącza ją całkowicie: plik nie jest pobierany, a zabronione strony są odwiedzane.
+
+### Pobieranie
+
+Przed pierwszą stroną z danego hosta wątek pobiera `scheme://host:port/robots.txt` - z tym samym
+`User-Agent` i `--timeout` co strony, najwyżej 500 KiB. `RobotsCache` zapamiętuje wynik do końca
+uruchomienia, więc każdy host jest pytany raz, niezależnie od liczby wątków. Plik nie trafia do tabeli
+`links` i nie liczy się do `--max-pages`. Linki do obcych hostów (bez `--all-hosts`) i do plików binarnych
+są pomijane wcześniej, więc dla nich `robots.txt` nie jest pobierany.
+
+| Odpowiedź serwera | Skutek |
+|---|---|
+| 2xx | Reguły z pliku. |
+| 4xx (np. 404 - pliku nie ma) | Brak ograniczeń. |
+| 5xx, przekroczony czas, błąd sieci | Wszystkie strony hosta zabronione do końca uruchomienia - nie wiadomo, na co host pozwala. |
+
+Metoda `RobotsCache.rulesFor` jest w całości `synchronized`, razem z pobieraniem. To celowe uproszczenie:
+dwa wątki nie pobiorą pliku tego samego hosta naraz i nie trzeba osobnej blokady dla każdego hosta.
+Zwykle odwiedzamy jeden host, więc pozostałe wątki czekają tylko raz, na początku pracy. Przy `--all-hosts`
+wątek czeka też wtedy, gdy inny pobiera `robots.txt` innego hosta.
+
+Przerwanie wątku w trakcie pobierania `robots.txt` (np. `shutdownNow`) nie jest zapamiętywane jako
+odpowiedź hosta - link wraca do `NEW`, tak jak przy przerwaniu pobierania strony.
+
+### Wybór grupy i reguły
+
+Plik składa się z grup: jedna lub kilka linii `User-agent`, a pod nimi reguły. Robot szuka grupy,
+której nazwa (bez względu na wielkość liter) to token produktu z jego `User-Agent` - część przed
+pierwszym `/` albo spacją, czyli domyślnie `pl.webcrawler`. Jeśli takiej nie ma, bierze grupę `*`,
+a bez żadnej z nich wolno wszystko. Kilka grup o tej samej nazwie jest łączonych w jedną.
+
+Reguły są porównywane ze ścieżką i query stringiem znormalizowanego adresu (`/szukaj?q=java`):
+
+- wygrywa reguła o najdłuższym pasującym wzorcu, a przy remisie `Allow`; gdy nie pasuje żadna - wolno,
+- wzorzec pasuje do początku ścieżki, `*` oznacza dowolny ciąg znaków, a `$` na końcu - koniec adresu,
+- pusty `Disallow:` niczego nie blokuje,
+- komentarze `#`, puste linie, BOM, końce linii CRLF, nieznane dyrektywy (np. `Sitemap`) i linie
+  bez dwukropka są pomijane.
+
+```
+User-agent: *
+Disallow: /shop
+Allow: /shop/public
+Disallow: /*.pdf$
+Crawl-delay: 1.5
+```
+
+| Ścieżka | Wynik | Dlaczego |
+|---|---|---|
+| `/shop/cart` | zabroniona | pasuje tylko `Disallow: /shop` |
+| `/shop/public/list` | dozwolona | `Allow: /shop/public` jest dłuższy niż `Disallow: /shop` |
+| `/files/a.pdf` | zabroniona | `*` pasuje do `files/a`, a `$` - do końca adresu |
+| `/files/a.pdf?v=2` | dozwolona | `$` wymaga, żeby adres kończył się na `.pdf` |
+| `/about` | dozwolona | nie pasuje żadna reguła |
+
+Strona zabroniona dostaje status `SKIPPED` z `error = 'robots.txt'`, bez żądania HTTP i bez zajmowania
+miejsca w `--max-pages`. To status końcowy: przy wznowieniu (także z `--ignore-robots`) strona nie jest
+pobierana - żeby ją odwiedzić, trzeba zacząć od nowa z `--fresh`. Dotyczy to też stron pominiętych dlatego,
+że `robots.txt` był niedostępny (5xx, timeout).
+
+### Crawl-delay
+
+`Crawl-delay` z wybranej grupy podaje w sekundach (także ułamkowych, np. `1.5`) minimalną przerwę
+między żądaniami. Przerwa po każdym żądaniu to dłuższa z wartości `--delay` i `Crawl-delay`, przy czym
+`Crawl-delay` jest ograniczony do 10 s (`CrawlerConfig.MAX_CRAWL_DELAY_MS`): plik pisze właściciel serwera,
+a wartość typu `3600` zatrzymałaby wątek na godzinę po każdej stronie. `--delay` nie jest ograniczane -
+tę wartość użytkownik wybrał sam. Tak jak `--delay`, przerwę robi każdy wątek osobno.
+
+### Meta tag robots
+
+Strona z `<meta name="robots" content="nofollow">` (albo `none`; wielkość liter bez znaczenia, wartości
+rozdzielone przecinkami lub spacjami) dostaje status `VISITED`, ale jej linki nie trafiają do bazy.
+Meta tag jest respektowany zawsze, także z `--ignore-robots`. `noindex` nie ma znaczenia - robot
+nie indeksuje treści.
+
+### Uproszczenia względem RFC 9309
+
+- Wzorce są porównywane dosłownie, bez sprowadzania kodowania `%XX` do jednej postaci
+  (`/%7Ea` i `/~a` to dla robota różne ścieżki).
+- Nazwa grupy musi być równa tokenowi - `User-agent: pl.webcrawler/1.2` nie pasuje.
+- Plik nie jest odświeżany w trakcie uruchomienia; nowe uruchomienie (także wznowienie) pobiera go od nowa.
+- Nie są obsługiwane: `Sitemap`, nagłówek `X-Robots-Tag` i `rel="nofollow"` przy pojedynczych linkach.
 
 ## Architektura
 
@@ -81,7 +172,9 @@ Wszystkie klasy są w pakiecie `pl.webcrawler`.
 | `Main` | Parsowanie argumentów, uruchomienie `Crawler`, shutdown hook dla Ctrl+C, wypisanie raportu. |
 | `CrawlerConfig` | Record z ustawieniami uruchomienia; sprawdza wartości i normalizuje adres startowy. |
 | `Crawler` | Przygotowuje bazę, tworzy pulę wątków (`Executors.newFixedThreadPool`), czeka na koniec, zbiera statystyki. |
-| `CrawlerThread` | `Runnable` - pętla: przejmij link → pobierz stronę → wyciągnij linki → zapisz je → oznacz stronę. |
+| `CrawlerThread` | `Runnable` - pętla: przejmij link → sprawdź `robots.txt` → pobierz stronę → wyciągnij linki → zapisz je → oznacz stronę. |
+| `RobotsTxt` | Reguły z `robots.txt` dla naszego robota: wybór grupy, `Allow`/`Disallow` (najdłuższe dopasowanie, `*`, `$`), `Crawl-delay`. Sama logika, bez sieci. |
+| `RobotsCache` | Pobiera `robots.txt` każdego hosta najwyżej raz na uruchomienie; jedna instancja wspólna dla wątków. |
 | `DBConn` | Cały SQL; jedna instancja współdzielona przez wątki, metody publiczne `synchronized`. |
 | `LinkRecord` | Record `(id, url, depth)` - link przejęty przez wątek. |
 | `AppVersion` | Wersja programu wczytana z `webcrawler-version.properties` (wartość zapasowa `dev`). |
@@ -120,7 +213,7 @@ CREATE INDEX IF NOT EXISTS idx_links_status_depth ON links (status, depth);
 | `claimed_by` | Nazwa wątku, który przejął link; zostaje po zakończeniu, stąd statystyka stron na wątek. |
 | `found_at` | Kiedy link pierwszy raz trafił do bazy (UTC). |
 | `visited_at` | Kiedy link otrzymał status końcowy (UTC). |
-| `error` | Opis błędu dla statusu `ERROR`, np. `HTTP 404`. |
+| `error` | Opis błędu dla statusu `ERROR`, np. `HTTP 404`, albo powód pominięcia dla `SKIPPED` (`robots.txt`). |
 
 Indeks na `(status, depth)` przyspiesza najczęstsze zapytanie: „daj linki `NEW` o głębokości do `maxDepth`,
 od najpłytszych” - i od razu podaje je w tej kolejności (patrz [punkt 2](#2-przejęcie-linku-warunkowym-update)).
@@ -133,7 +226,7 @@ stateDiagram-v2
     NEW --> IN_PROGRESS: claimNextLink
     IN_PROGRESS --> VISITED: saveVisitedPage / markVisited
     IN_PROGRESS --> ERROR: markError
-    IN_PROGRESS --> SKIPPED: markSkipped
+    IN_PROGRESS --> SKIPPED: markSkipped (obcy host, plik binarny, robots.txt)
     IN_PROGRESS --> NEW: releaseLink / resetInProgress
 ```
 
@@ -143,7 +236,7 @@ stateDiagram-v2
 | `IN_PROGRESS` | Przejęty przez wątek (`claimed_by`), który właśnie go przetwarza. |
 | `VISITED` | Strona pobrana, linki z niej zapisane. |
 | `ERROR` | Obsługa strony się nie powiodła: kod HTTP 4xx/5xx, typ treści inny niż HTML/XML, przekroczony czas, błąd sieci albo inny nieoczekiwany wyjątek (wtedy w `error` jest nazwa klasy i komunikat). Opis w `error`. |
-| `SKIPPED` | Pominięty bez żądania HTTP: inny host (bez `--all-hosts`) albo plik binarny po rozszerzeniu (`.pdf`, `.jpg`, `.zip`, ...). |
+| `SKIPPED` | Pominięty bez żądania HTTP: inny host (bez `--all-hosts`), plik binarny po rozszerzeniu (`.pdf`, `.jpg`, `.zip`, ...) albo strona zabroniona w `robots.txt` - wtedy w `error` jest `robots.txt` (patrz [robots.txt](#robotstxt)). |
 
 Link wraca z `IN_PROGRESS` do `NEW`, gdy wątek oddaje go po wyczerpaniu limitu stron, przerwaniu
 lub błędzie bazy (`releaseLink`) albo przy starcie programu po przerwanym uruchomieniu (`resetInProgress`).
@@ -174,6 +267,7 @@ nie zmienia, bo bazy, które już je mają, nie wykonają ich drugi raz.
 sqlite3 crawler.db "SELECT status, COUNT(*) FROM links GROUP BY status;"
 sqlite3 crawler.db "SELECT url, seen FROM links ORDER BY seen DESC LIMIT 10;"
 sqlite3 crawler.db "SELECT url, error FROM links WHERE status = 'ERROR';"
+sqlite3 crawler.db "SELECT url FROM links WHERE status = 'SKIPPED' AND error = 'robots.txt';"
 sqlite3 crawler.db "PRAGMA user_version;"
 ```
 
@@ -192,13 +286,15 @@ flowchart TD
     pending -- tak --> wait["sleep 200 ms"] --> stop
     claimed -- tak --> skip{"obcy host<br/>lub plik binarny?"}
     skip -- tak --> skipped["db.markSkipped()"] --> stop
-    skip -- nie --> reserve{"pagesFetched.incrementAndGet()<br/>> maxPages?"}
+    skip -- nie --> robots{"robots.txt hosta zabrania?<br/>(RobotsCache; bez sprawdzania<br/>przy --ignore-robots)"}
+    robots -- tak --> robotsSkipped["db.markSkipped(id, robots.txt)"] --> stop
+    robots -- nie --> reserve{"pagesFetched.incrementAndGet()<br/>> maxPages?"}
     reserve -- tak --> release["cofnij licznik<br/>db.releaseLink()"] --> finish
     reserve -- nie --> fetch["Jsoup.connect(url).get()"]
-    fetch -- sukces --> extract["extractLinks()<br/>absUrl + UrlUtils.normalize"]
+    fetch -- sukces --> extract["extractLinks()<br/>absUrl + UrlUtils.normalize<br/>(pusta lista przy meta robots nofollow)"]
     extract --> visited["db.saveVisitedPage()<br/>jedna transakcja: UPSERT linków (depth + 1)<br/>+ status VISITED"]
     fetch -- "HTTP 4xx/5xx, timeout, zły typ,<br/>błąd sieci, inny RuntimeException" --> error["db.markError()<br/>klasa + komunikat"]
-    visited --> delay["sleep delayMs"]
+    visited --> delay["sleep max(delayMs, Crawl-delay)<br/>Crawl-delay najwyżej 10 s"]
     error --> delay
     delay --> stop
     dberr(["DatabaseException<br/>w dowolnym kroku"]) --> dbstop["db.releaseLink() - błąd ignorowany<br/>zapisz pierwszy błąd dla Crawlera<br/>stopRequested = true"]
@@ -211,8 +307,8 @@ wątek nie zobaczy strony `VISITED` bez jej linków. To ważne dla kończenia pr
 Gdyby `VISITED` pojawiło się przed linkami, pozostałe wątki mogłyby zakończyć się w tej krótkiej chwili,
 zostawiając całą pracę jednemu wątkowi.
 
-Przerwanie wątku (np. `shutdownNow`) w trakcie pobierania oddaje link (`releaseLink`) - strona
-nie jest wadliwa, więc nie dostaje statusu `ERROR`. Dlatego `Crawler` po `shutdownNow()` czeka jeszcze
+Przerwanie wątku (np. `shutdownNow`) w trakcie pobierania strony albo jej `robots.txt` oddaje link
+(`releaseLink`) - strona nie jest wadliwa, więc nie dostaje statusu `ERROR` ani `SKIPPED`. Dlatego `Crawler` po `shutdownNow()` czeka jeszcze
 na wątki (najwyżej limit czasu jednego żądania), zanim zamknie bazę - inaczej wątek trafiłby na zamknięte połączenie.
 
 ### Wyjątki w wątku
@@ -381,14 +477,16 @@ lokalny `com.sun.net.httpserver.HttpServer` z JDK.
 
 | Test | Co sprawdza |
 |---|---|
-| `UrlUtilsTest` | Normalizacja, porównywanie hostów, pliki binarne. |
-| `CrawlerThreadTest` | `extractLinks` na HTML z pamięci. |
-| `DBConnTest` | Każda metoda `DBConn` na pliku SQLite w katalogu tymczasowym, w tym kolejność przejmowania (najpłytsze linki pierwsze, także po zmniejszeniu `depth`) i migracje schematu (nowa baza, baza sprzed wersjonowania, baza z nowszej wersji, `dropTables`). |
+| `UrlUtilsTest` | Normalizacja, porównywanie hostów, pliki binarne, ścieżka z query porównywana z `robots.txt`. |
+| `RobotsTxtTest` | Parsowanie `robots.txt` (testy parametryzowane): wybór grupy, najdłuższe dopasowanie i remis, `*` i `$`, pusty `Disallow`, `Crawl-delay`, śmieci w pliku (BOM, CRLF, komentarze, nieznane dyrektywy, linie bez dwukropka). |
+| `RobotsCacheTest` | Pobieranie `robots.txt` z lokalnego serwera: 200, 4xx, 5xx, timeout, błąd sieci, przerwanie wątku; przy 8 wątkach naraz plik pobrany raz, osobno dla każdego portu (licznik żądań). |
+| `CrawlerThreadTest` | `extractLinks` na HTML z pamięci, meta tag `robots` (`nofollow`, `none`), przerwa po żądaniu (`--delay` i ograniczony `Crawl-delay`). |
+| `DBConnTest` | Każda metoda `DBConn` na pliku SQLite w katalogu tymczasowym, w tym kolejność przejmowania (najpłytsze linki pierwsze, także po zmniejszeniu `depth`), `markSkipped` z powodem i migracje schematu (nowa baza, baza sprzed wersjonowania, baza z nowszej wersji, `dropTables`). |
 | `DBConnConcurrencyTest` | 8 wątków przejmuje 200 linków - każdy link trafia do dokładnie jednego wątku (wspólne i osobne połączenia, test powtarzany). |
-| `CrawlerThreadRunTest` | Cała pętla `run()` na lokalnej stronie: statusy, `seen`, limit stron, zatrzymanie. |
-| `CrawlerTest`, `CrawlerEndToEndTest` | Cały robot z pulą wątków: każda strona pobrana dokładnie raz (licznik żądań po stronie serwera), cykle, duplikaty, 404, wznowienie. |
+| `CrawlerThreadRunTest` | Cała pętla `run()` na lokalnej stronie: statusy, `seen`, limit stron, zatrzymanie, `Crawl-delay` jako przerwa, przerwanie w trakcie pobierania `robots.txt` (link wraca do `NEW`). |
+| `CrawlerTest`, `CrawlerEndToEndTest` | Cały robot z pulą wątków: każda strona pobrana dokładnie raz (licznik żądań po stronie serwera), cykle, duplikaty, 404, wznowienie; `robots.txt` pobrany raz, strona zabroniona → `SKIPPED` z `error = 'robots.txt'` bez żądania, `--ignore-robots`, strona z meta `nofollow`. |
 | `CrawlerFailureTest` | Wyjątki w wątkach (podklasa `DBConn` rzucająca z `saveVisitedPage`): nieoczekiwany błąd strony daje `ERROR` i nie zawiesza robota, `DatabaseException` wychodzi z `Crawler.run()`, a link wraca do `NEW`. |
-| `MainTest` | Parsowanie argumentów (w tym granice `--timeout` i znaki w `--user-agent`), pomoc, `--version`, wersja w komunikacie startowym i domyślnym User-Agent, tekst raportu. |
+| `MainTest` | Parsowanie argumentów (w tym granice `--timeout`, znaki w `--user-agent` i `--ignore-robots`), pomoc, `--version`, wersja w komunikacie startowym i domyślnym User-Agent, czas czekania po Ctrl+C, tekst raportu. |
 | `AppVersionTest` | Wersja z przefiltrowanego zasobu; `dev`, gdy pliku brak albo nie był filtrowany. |
 
 GitHub Actions (`.github/workflows/ci.yml`) uruchamia `mvn -B verify` na JDK 27 przy każdym pushu
@@ -413,12 +511,13 @@ Program uruchomiony bez Mavena (np. sama kompilacja w IDE) pokazuje wersję `dev
 
 ## Ograniczenia
 
-- **Brak obsługi `robots.txt`** ani meta tagu `robots` - robot nie sprawdza, czy właściciel strony pozwala na indeksowanie.
+- **`robots.txt` w uproszczonej wersji** - patrz [Uproszczenia względem RFC 9309](#uproszczenia-względem-rfc-9309).
+  Strony pominięte przez `robots.txt` (także niedostępny) zostają `SKIPPED` przy wznowieniu.
 - **Tylko statyczny HTML.** jsoup nie wykonuje JavaScriptu, więc linki dodawane przez skrypty nie są widoczne.
 - **Przekierowania.** jsoup podąża za przekierowaniami, ale w bazie zostaje adres pierwotny. Dwa adresy
   przekierowujące na tę samą stronę (np. `/a` i `/a/`) to dwa wiersze i dwa pobrania. Normalizacja nie
   zna też `<link rel="canonical">`, kolejności parametrów w query stringu ani końcowego `/`.
-- **Przerwa `--delay` jest na wątek, nie na serwer** - przy 4 wątkach serwer dostaje do 4 żądań w czasie jednej przerwy.
+- **Przerwa `--delay` i `Crawl-delay` jest na wątek, nie na serwer** - przy 4 wątkach serwer dostaje do 4 żądań w czasie jednej przerwy.
 - **Pliki binarne rozpoznawane po rozszerzeniu.** `/pobierz.php?f=a.pdf` zostanie pobrany; jsoup odrzuci go
   dopiero po nagłówku `Content-Type` (status `ERROR`).
 - **Kolejność wszerz przy kilku wątkach.** Wątek bierze najpłytszy link `NEW` dostępny w chwili przejęcia,
@@ -432,7 +531,6 @@ Program uruchomiony bez Mavena (np. sama kompilacja w IDE) pokazuje wersję `dev
 
 ## Pomysły na rozwój
 
-- Pobieranie i respektowanie `robots.txt` (w tym `Crawl-delay`).
 - Wspólny limit tempa na host zamiast przerwy w każdym wątku.
 - Zapisywanie adresu docelowego po przekierowaniu i `rel="canonical"`, żeby wykrywać kolejne duplikaty.
 - Ponawianie stron z błędem przejściowym (timeout, HTTP 5xx) z ograniczoną liczbą prób.

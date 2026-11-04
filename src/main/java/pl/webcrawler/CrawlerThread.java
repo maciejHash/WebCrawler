@@ -26,15 +26,20 @@ public class CrawlerThread implements Runnable {
     /** Ile czekać, gdy nie ma linku NEW, ale inny wątek może jeszcze jakieś dodać. */
     static final long WAIT_FOR_WORK_MS = 200;
 
+    /** Wartość kolumny error dla linków pominiętych, bo zabrania ich robots.txt. */
+    static final String ROBOTS_SKIP_REASON = "robots.txt";
+
     private final DBConn db;
     private final CrawlerConfig config;
+    private final RobotsCache robots;
     private final AtomicInteger pagesFetched;
     private final AtomicBoolean stopRequested;
     private final AtomicReference<DatabaseException> dbFailure;
 
     /**
-     * Wszystkie wątki dostają te same obiekty db, config, pagesFetched, stopRequested i dbFailure.
+     * Wszystkie wątki dostają te same obiekty db, config, robots, pagesFetched, stopRequested i dbFailure.
      *
+     * @param robots        wspólne dla wątków, żeby robots.txt każdego hosta był pobierany raz
      * @param pagesFetched  licznik wspólny dla wszystkich wątków; dzięki niemu limit
      *                      maxPages dotyczy całego robota, a nie pojedynczego wątku
      * @param stopRequested flaga wspólna dla wszystkich wątków; ustawiona (np. po Ctrl+C)
@@ -42,10 +47,11 @@ public class CrawlerThread implements Runnable {
      * @param dbFailure     tu wątek zapisuje błąd bazy; run() z Runnable nie może rzucić
      *                      wyjątku do Crawlera, więc przekazujemy go przez wspólny obiekt
      */
-    public CrawlerThread(DBConn db, CrawlerConfig config, AtomicInteger pagesFetched,
+    public CrawlerThread(DBConn db, CrawlerConfig config, RobotsCache robots, AtomicInteger pagesFetched,
                          AtomicBoolean stopRequested, AtomicReference<DatabaseException> dbFailure) {
         this.db = db;
         this.config = config;
+        this.robots = robots;
         this.pagesFetched = pagesFetched;
         this.stopRequested = stopRequested;
         this.dbFailure = dbFailure;
@@ -138,6 +144,19 @@ public class CrawlerThread implements Runnable {
             return true;
         }
 
+        // robots.txt przed rezerwacją miejsca w limicie: zabroniona strona nie wymaga żądania HTTP,
+        // więc nie może zabrać miejsca stronie dozwolonej.
+        long crawlDelayMs = 0;
+        if (config.respectRobots()) {
+            RobotsTxt rules = robotsFor(link);
+            if (!rules.isAllowed(UrlUtils.pathWithQuery(link.url()))) {
+                db.markSkipped(link.id(), ROBOTS_SKIP_REASON);
+                log("pominięto (robots.txt) " + link.url());
+                return true;
+            }
+            crawlDelayMs = rules.crawlDelayMs().orElse(0);
+        }
+
         // Rezerwacja miejsca tuż przed żądaniem: incrementAndGet jest atomowe, więc
         // nawet przy wielu wątkach naraz dokładnie maxPages z nich dostanie wartość <= limit.
         if (pagesFetched.incrementAndGet() > config.maxPages()) {
@@ -182,8 +201,30 @@ public class CrawlerThread implements Runnable {
         }
 
         // Grzeczność wobec serwera: przerwa po każdym żądaniu, także nieudanym.
-        Thread.sleep(config.delayMs());
+        Thread.sleep(pauseAfterRequestMs(config.delayMs(), crawlDelayMs));
         return true;
+    }
+
+    /**
+     * Przerwa po żądaniu: dłuższa z --delay i Crawl-delay hosta. Crawl-delay ograniczamy do
+     * {@link CrawlerConfig#MAX_CRAWL_DELAY_MS}, bo wpisuje go właściciel serwera; --delay
+     * użytkownik wybrał sam, więc go nie skracamy.
+     */
+    static long pauseAfterRequestMs(int delayMs, long crawlDelayMs) {
+        return Math.max(delayMs, Math.min(crawlDelayMs, CrawlerConfig.MAX_CRAWL_DELAY_MS));
+    }
+
+    /**
+     * Reguły robots.txt hosta strony. Przerwanie w trakcie pobierania robots.txt traktujemy
+     * jak przerwanie pobierania strony: link wraca do NEW, a nie dostaje SKIPPED.
+     */
+    private RobotsTxt robotsFor(LinkRecord link) throws InterruptedException {
+        try {
+            return robots.rulesFor(link.url());
+        } catch (InterruptedException e) {
+            db.releaseLink(link.id());
+            throw e;
+        }
     }
 
     /** Pomijamy bez żądania HTTP: obce hosty (jeśli tak ustawiono) i pliki binarne. */
@@ -204,8 +245,13 @@ public class CrawlerThread implements Runnable {
      * Duplikaty zostają celowo: każde wystąpienie zwiększa {@code seen} w bazie.
      * Pomijane są puste {@code href} oraz adresy, których {@link UrlUtils#normalize}
      * nie przyjmuje (mailto:, javascript:, tel: itp.).
+     * Strona z meta tagiem robots {@code nofollow} albo {@code none} nie daje żadnych linków.
      */
     static List<String> extractLinks(Document doc) {
+        if (forbidsFollowingLinks(doc)) {
+            // Strona i tak dostaje VISITED - została pobrana, tylko nie idziemy za jej linkami.
+            return List.of();
+        }
         List<String> links = new ArrayList<>();
         for (Element anchor : doc.select("a[href]")) {
             // Pusty href jsoup rozwiązałby do adresu bieżącej strony - to nie jest prawdziwy link.
@@ -217,6 +263,26 @@ public class CrawlerThread implements Runnable {
             UrlUtils.normalize(anchor.absUrl("href")).ifPresent(links::add);
         }
         return links;
+    }
+
+    /**
+     * {@code <meta name="robots" content="noindex, nofollow">} - właściciel prosi, żeby roboty
+     * nie szły za linkami strony; {@code none} znaczy to samo co {@code noindex, nofollow}.
+     * Nazwa i wartości bez względu na wielkość liter. Wartości rozdziela przecinek, ale
+     * przyjmujemy też same spacje ({@code "noindex nofollow"}) - tak też zdarza się pisać.
+     */
+    static boolean forbidsFollowingLinks(Document doc) {
+        for (Element meta : doc.select("meta[name]")) {
+            if (!meta.attr("name").strip().equalsIgnoreCase("robots")) {
+                continue;
+            }
+            for (String value : meta.attr("content").split("[,\\s]+")) {
+                if (value.equalsIgnoreCase("nofollow") || value.equalsIgnoreCase("none")) {
+                    return true;
+                }
+            }
+        }
+        return false;
     }
 
     private void markError(LinkRecord link, String message) {

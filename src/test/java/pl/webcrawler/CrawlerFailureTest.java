@@ -132,7 +132,7 @@ class CrawlerFailureTest {
     }
 
     private CrawlerConfig config(int threads) {
-        return new CrawlerConfig(base + "/", threads, 100, 5, true, dbPath, false, 2_000, 0, "test-agent");
+        return new CrawlerConfig(base + "/", threads, 100, 5, true, dbPath, false, 2_000, 0, "test-agent", true);
     }
 
     private Crawler crawlerFailingOnPoison(int threads, RuntimeException failure, boolean releaseFails) {

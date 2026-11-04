@@ -74,6 +74,9 @@ public class Crawler {
         // Pierwszy błąd bazy z któregokolwiek wątku. Wątek zapisuje go tutaj i kończy pracę,
         // a my rzucamy go dalej dopiero, gdy wszystkie wątki się zatrzymają.
         AtomicReference<DatabaseException> dbFailure = new AtomicReference<>();
+        // Jedna dla wszystkich wątków, żeby robots.txt każdego hosta był pobrany raz. Nowa przy
+        // każdym uruchomieniu: wznowienie pracy pobiera aktualną wersję pliku.
+        RobotsCache robots = new RobotsCache(config.userAgent(), config.timeoutMs());
         try {
             prepareDatabase(db);
 
@@ -81,7 +84,7 @@ public class Crawler {
             for (int i = 0; i < config.threads(); i++) {
                 // execute, a nie submit: przy submit wyjątek z wątku zostałby po cichu
                 // schowany w Future; tu JVM wypisze go razem z nazwą wątku.
-                pool.execute(new CrawlerThread(db, config, pagesFetched, stopRequested, dbFailure));
+                pool.execute(new CrawlerThread(db, config, robots, pagesFetched, stopRequested, dbFailure));
             }
             // shutdown nie przerywa wątków - tylko zamyka pulę na nowe zadania,
             // dzięki czemu awaitTermination zwróci true, gdy wszystkie skończą pracę.

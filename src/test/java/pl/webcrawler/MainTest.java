@@ -69,6 +69,7 @@ class MainTest {
         assertEquals(CrawlerConfig.DEFAULT_TIMEOUT_MS, config.timeoutMs());
         assertEquals(CrawlerConfig.DEFAULT_USER_AGENT, config.userAgent());
         assertFalse(config.fresh(), "domyślnie wznawiamy poprzednią pracę");
+        assertTrue(config.respectRobots(), "domyślnie robots.txt jest respektowany");
     }
 
     @Test
@@ -76,7 +77,7 @@ class MainTest {
         CrawlerConfig config = Main.parseArgs(new String[] {
                 "--threads", "8", "--all-hosts", "https://example.com/start",
                 "--max-pages", "50", "--max-depth", "0", "--db", "out.db",
-                "--fresh", "--delay", "0", "--timeout", "2500",
+                "--fresh", "--delay", "0", "--timeout", "2500", "--ignore-robots",
                 // Jeden argument ze spacjami - tak przekaże go powłoka dla wartości w cudzysłowie.
                 "--user-agent", "MojRobot/2.0 (+https://example.com/bot)"});
 
@@ -90,6 +91,26 @@ class MainTest {
         assertEquals(0, config.delayMs());
         assertEquals(2500, config.timeoutMs());
         assertEquals("MojRobot/2.0 (+https://example.com/bot)", config.userAgent());
+        assertFalse(config.respectRobots());
+    }
+
+    private static CrawlerConfig configWith(int timeoutMs, int delayMs, boolean respectRobots) {
+        return new CrawlerConfig("https://a.pl", 1, 1, 0, true, "x.db", false, timeoutMs, delayMs,
+                "test-agent", respectRobots);
+    }
+
+    @Test
+    void shutdownWaitCoversRobotsFetchPageFetchAndLongestPause() {
+        long margin = Main.SHUTDOWN_MARGIN_MS;
+        // robots.txt + strona (2 × timeout) + przerwa, która może urosnąć do MAX_CRAWL_DELAY_MS.
+        assertEquals(2 * 2_000 + CrawlerConfig.MAX_CRAWL_DELAY_MS + margin,
+                Main.shutdownWaitMs(configWith(2_000, 500, true)));
+        // --delay dłuższe niż limit Crawl-delay - liczy się --delay.
+        assertEquals(2 * 2_000 + 20_000 + margin, Main.shutdownWaitMs(configWith(2_000, 20_000, true)));
+        // --ignore-robots: bez pobierania robots.txt i bez Crawl-delay.
+        assertEquals(2_000 + 500 + margin, Main.shutdownWaitMs(configWith(2_000, 500, false)));
+        // Bardzo duże wartości nie przekraczają zakresu.
+        assertTrue(Main.shutdownWaitMs(configWith(Integer.MAX_VALUE, Integer.MAX_VALUE, true)) > 0);
     }
 
     @Test
@@ -153,6 +174,7 @@ class MainTest {
         assertTrue(usage.contains("--timeout"), usage);
         assertTrue(usage.contains("--user-agent"), usage);
         assertTrue(usage.contains("--version"), usage);
+        assertTrue(usage.contains("--ignore-robots"), usage);
         assertTrue(usage.contains(CrawlerConfig.DEFAULT_USER_AGENT), usage);
         assertTrue(usage.contains("Wznawianie"), usage);
         assertTrue(usage.contains("java -jar"), usage);
@@ -182,6 +204,8 @@ class MainTest {
             https://a.pl --max-depth -1                    | --max-depth: wartość musi być >= 0
             https://a.pl --threads 2 --threads 3           | Opcja --threads podana więcej niż raz
             https://a.pl --fresh --fresh                   | Opcja --fresh podana więcej niż raz
+            https://a.pl --ignore-robots --ignore-robots   | Opcja --ignore-robots podana więcej niż raz
+            https://a.pl --ignore-robots=yes               | Nieznana opcja: --ignore-robots=yes
             https://a.pl --delay                           | Brak wartości po --delay
             https://a.pl --delay -1                        | --delay: wartość musi być >= 0, podano: -1
             https://a.pl --delay 1s                        | --delay: oczekiwano liczby całkowitej, podano: 1s

@@ -122,6 +122,11 @@ public class DBConn implements AutoCloseable {
             UPDATE links SET status = 'SKIPPED', visited_at = CURRENT_TIMESTAMP
             WHERE id = ?""";
 
+    // Powód pominięcia trafia do kolumny error - jak opis błędu przy ERROR.
+    private static final String MARK_SKIPPED_WITH_REASON = """
+            UPDATE links SET status = 'SKIPPED', visited_at = CURRENT_TIMESTAMP, error = ?
+            WHERE id = ?""";
+
     private static final String RELEASE_LINK = """
             UPDATE links SET status = 'NEW', claimed_by = NULL
             WHERE id = ? AND status = 'IN_PROGRESS'""";
@@ -364,6 +369,17 @@ public class DBConn implements AutoCloseable {
     /** Link świadomie pominięty bez żądania HTTP: obcy host albo plik binarny. */
     public synchronized void markSkipped(long id) {
         updateById(MARK_SKIPPED, id, "Nie można oznaczyć linku jako SKIPPED: ");
+    }
+
+    /** Link pominięty bez żądania HTTP z podanego powodu (np. "robots.txt"), zapisanego w kolumnie error. */
+    public synchronized void markSkipped(long id, String reason) {
+        try (PreparedStatement stmt = openConnection().prepareStatement(MARK_SKIPPED_WITH_REASON)) {
+            stmt.setString(1, reason);
+            stmt.setLong(2, id);
+            stmt.executeUpdate();
+        } catch (SQLException e) {
+            throw new DatabaseException("Nie można oznaczyć linku jako SKIPPED: " + id, e);
+        }
     }
 
     /** Oddaje przejęty link (IN_PROGRESS → NEW), żeby mógł go wziąć inny wątek. */

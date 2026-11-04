@@ -6,12 +6,30 @@ zmiany jeszcze niewydane są w sekcji „Niewydane”.
 
 ## [Niewydane]
 
+### Dodane
+
+- Obsługa `robots.txt` (uproszczona wersja RFC 9309): plik każdego hosta jest pobierany najwyżej raz
+  na uruchomienie (`RobotsCache`), wybierana jest grupa dla tokenu produktu z `User-Agent` albo grupa `*`,
+  a o dostępie decyduje najdłuższa pasująca reguła `Allow`/`Disallow` (przy remisie `Allow`; obsługa `*` i `$`).
+  Odpowiedź 4xx oznacza brak ograniczeń, a 5xx, timeout i błąd sieci - wszystkie strony hosta zabronione
+  do końca uruchomienia. `robots.txt` nie trafia do bazy i nie liczy się do `--max-pages`.
+- Strona zabroniona w `robots.txt` dostaje status `SKIPPED` z `error = 'robots.txt'`, bez żądania HTTP.
+- `Crawl-delay` z `robots.txt`: przerwa po żądaniu to dłuższa z wartości `--delay` i `Crawl-delay`
+  (ten drugi najwyżej 10 s).
+- Meta tag `<meta name="robots" content="nofollow">` (albo `none`): strona dostaje `VISITED`, ale jej
+  linki nie są zapisywane.
+- Opcja `--ignore-robots` - robot nie pobiera `robots.txt` i odwiedza także strony, których zabrania.
+
 ### Zmienione
 
 - Wątki przejmują linki w kolejności wszerz: najpierw najbliższe strony startowej (najmniejsze `depth`),
   a przy równej głębokości najstarsze (`ORDER BY depth, id` zamiast `ORDER BY id`). Link znaleziony później
   krótszą drogą przesuwa się w kolejce, a przy limicie `--max-pages` pobierane są najpierw strony najbliższe
   startowej. Kolejność wynika z istniejącego indeksu `(status, depth)` bez sortowania - schemat bazy bez zmian.
+- `robots.txt` jest domyślnie respektowany: robot wysyła dodatkowe żądanie `/robots.txt` do każdego
+  odwiedzanego hosta i pomija strony, których plik zabrania (wcześniej odwiedzał wszystkie). Dawne
+  zachowanie daje `--ignore-robots`. Ctrl+C czeka na wątki dłużej - także na pobieranie `robots.txt`
+  i `Crawl-delay` (najwyżej 2 × `--timeout` + dłuższa z wartości `--delay` i 10 s + 5 s).
 
 ## [1.1.0] - 2026-11-03
 

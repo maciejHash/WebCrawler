@@ -79,4 +79,61 @@ class CrawlerThreadTest {
     void emptyPageHasNoLinks() {
         assertTrue(linksFrom("<p>brak linków</p>").isEmpty());
     }
+
+    private static List<String> linksFromPageWithMeta(String meta) {
+        Document doc = Jsoup.parse("<html><head>" + meta + "</head><body>"
+                + "<a href=\"a.html\">a</a> <a href=\"b.html\">b</a></body></html>", BASE);
+        return CrawlerThread.extractLinks(doc);
+    }
+
+    @ParameterizedTest(name = "[{index}] {0}")
+    @ValueSource(strings = {
+            "<meta name=\"robots\" content=\"nofollow\">",
+            "<meta name=\"robots\" content=\"noindex, nofollow\">",
+            "<meta name=\"robots\" content=\"NoIndex,NOFOLLOW\">",
+            "<meta name=\"robots\" content=\"noindex nofollow\">",
+            "<meta name=\"robots\" content=\"none\">",
+            "<meta name=\"ROBOTS\" content=\"None\">",
+            "<meta name=\"description\" content=\"x\"><meta name=\"robots\" content=\"nofollow\">"
+    })
+    void metaRobotsNofollowGivesNoLinks(String meta) {
+        assertTrue(linksFromPageWithMeta(meta).isEmpty());
+    }
+
+    @ParameterizedTest(name = "[{index}] {0}")
+    @ValueSource(strings = {
+            "",
+            "<meta name=\"robots\" content=\"noindex\">",
+            "<meta name=\"robots\" content=\"index, follow\">",
+            "<meta name=\"robots\" content=\"nofollowing\">",
+            "<meta name=\"googlebot\" content=\"nofollow\">",
+            "<meta name=\"description\" content=\"nofollow\">",
+            "<meta property=\"robots\" content=\"nofollow\">"
+    })
+    void otherMetaTagsKeepLinks(String meta) {
+        assertEquals(List.of("https://example.com/dir/a.html", "https://example.com/dir/b.html"),
+                linksFromPageWithMeta(meta));
+    }
+
+    @Test
+    void metaRobotsInBodyIsAlsoRespected() {
+        assertTrue(linksFrom("<meta name=\"robots\" content=\"nofollow\"><a href=\"a.html\">a</a>").isEmpty());
+    }
+
+    @ParameterizedTest(name = "delay {0} ms, Crawl-delay {1} ms -> {2} ms")
+    @CsvSource(delimiter = '|', textBlock = """
+            # brak Crawl-delay (0) - samo --delay
+            500   | 0          | 500
+            0     | 0          | 0
+            # wygrywa dłuższa z dwóch przerw
+            500   | 2000       | 2000
+            3000  | 2000       | 3000
+            # Crawl-delay najwyżej MAX_CRAWL_DELAY_MS (10 s), --delay bez limitu
+            0     | 60000      | 10000
+            500   | 9223372036854775807 | 10000
+            20000 | 60000      | 20000
+            """)
+    void pauseIsLongerOfDelayAndCappedCrawlDelay(int delayMs, long crawlDelayMs, long expected) {
+        assertEquals(expected, CrawlerThread.pauseAfterRequestMs(delayMs, crawlDelayMs));
+    }
 }

@@ -15,10 +15,11 @@ package pl.webcrawler;
  * @param timeoutMs    limit czasu jednego żądania HTTP
  * @param delayMs      przerwa po każdym żądaniu, żeby nie przeciążać serwera
  * @param userAgent    nagłówek User-Agent wysyłany z każdym żądaniem
+ * @param respectRobots czy pobierać robots.txt każdego hosta i pomijać strony, których zabrania
  */
 public record CrawlerConfig(String startUrl, int threads, int maxPages, int maxDepth,
                             boolean sameHostOnly, String dbPath, boolean fresh, int timeoutMs,
-                            int delayMs, String userAgent) {
+                            int delayMs, String userAgent, boolean respectRobots) {
 
     public static final int DEFAULT_THREADS = 4;
     public static final int DEFAULT_MAX_PAGES = 100;
@@ -31,6 +32,13 @@ public record CrawlerConfig(String startUrl, int threads, int maxPages, int maxD
     // Wersja z pom.xml, żeby administrator serwera wiedział, która wersja robota go odwiedza.
     // Tylko drukowalne ASCII - nagłówki HTTP nie powinny zawierać innych znaków (sprawdza konstruktor).
     public static final String DEFAULT_USER_AGENT = "pl.webcrawler/" + AppVersion.get() + " (student project)";
+    public static final boolean DEFAULT_RESPECT_ROBOTS = true;
+    /**
+     * Górny limit Crawl-delay z robots.txt. Plik pisze właściciel serwera, nie użytkownik - wartość
+     * typu "Crawl-delay: 3600" zatrzymałaby wątek na godzinę po każdej stronie i opóźniła Ctrl+C.
+     * Nie ogranicza --delay: tę wartość użytkownik wybrał sam.
+     */
+    public static final int MAX_CRAWL_DELAY_MS = 10_000;
 
     /**
      * Sprawdza wartości od razu przy tworzeniu, żeby błąd w argumentach wyszedł na starcie,

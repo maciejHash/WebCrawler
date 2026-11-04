@@ -418,6 +418,22 @@ class DBConnTest {
         DBConn.LinkRow row = db.findByUrl(URL).orElseThrow();
         assertEquals("SKIPPED", row.status());
         assertNotNull(row.visitedAt());
+        assertNull(row.error());
+    }
+
+    @Test
+    void markSkippedWithReasonStoresReasonInErrorColumn() {
+        LinkRecord link = insertAndClaim(URL);
+
+        db.markSkipped(link.id(), "robots.txt");
+
+        DBConn.LinkRow row = db.findByUrl(URL).orElseThrow();
+        assertEquals("SKIPPED", row.status());
+        assertEquals("robots.txt", row.error());
+        assertNotNull(row.visitedAt());
+        // Pominięty link nie jest pracą do wykonania ani nie był pobrany przez wątek.
+        assertFalse(db.hasPendingWork(0));
+        assertTrue(db.countPagesByWorker().isEmpty());
     }
 
     @Test
