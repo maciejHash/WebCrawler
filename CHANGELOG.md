@@ -19,6 +19,15 @@ zmiany jeszcze niewydane są w sekcji „Niewydane”.
 - Meta tag `<meta name="robots" content="nofollow">` (albo `none`): strona dostaje `VISITED`, ale jej
   linki nie są zapisywane.
 - Opcja `--ignore-robots` - robot nie pobiera `robots.txt` i odwiedza także strony, których zabrania.
+- Ponawianie stron z błędem przejściowym: przekroczony czas, odrzucone połączenie, HTTP 429 i 5xx.
+  Link wraca do kolejki (`NEW`) z terminem ponowienia - przerwy 1, 2, 4... s, najwyżej 30 s - i może go
+  przejąć dowolny wątek. Po wyczerpaniu prób strona dostaje `ERROR` z ich liczbą, np. `HTTP 503 (po 3 próbach)`.
+  Pozostałe błędy (np. 404) kończą się `ERROR` od razu, jak dotąd. Każda próba liczy się do `--max-pages`,
+  a liczba prób i termin ponowienia przetrwają wznowienie pracy.
+- Opcja `--retries N` - liczba ponowień po błędzie przejściowym (domyślnie 2, `0` = bez ponawiania,
+  czyli dawne zachowanie).
+- Migracja schematu bazy do wersji 2: kolumny `attempts` i `retry_at` w tabeli `links`. Bazy z wcześniejszych
+  wersji są uzupełniane automatycznie bez utraty danych.
 
 ### Zmienione
 

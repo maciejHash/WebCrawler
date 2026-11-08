@@ -120,7 +120,7 @@ class CrawlerTest {
 
     private CrawlerConfig config(int maxPages, boolean fresh) {
         return new CrawlerConfig(base + "/", THREADS, maxPages, 20, true,
-                tempDir.resolve("crawl.db").toString(), fresh, 2_000, 0, "test-agent", true);
+                tempDir.resolve("crawl.db").toString(), fresh, 2_000, 0, "test-agent", true, CrawlerConfig.DEFAULT_MAX_RETRIES);
     }
 
     /** Osobne połączenie do sprawdzenia bazy - Crawler zamyka swoje po zakończeniu. */

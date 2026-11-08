@@ -26,7 +26,8 @@ public class Main {
     static final List<String> STATUSES = List.of("NEW", "IN_PROGRESS", "VISITED", "ERROR", "SKIPPED");
 
     private static final Set<String> OPTIONS_WITH_VALUE =
-            Set.of("--threads", "--max-pages", "--max-depth", "--db", "--delay", "--timeout", "--user-agent");
+            Set.of("--threads", "--max-pages", "--max-depth", "--db", "--delay", "--timeout", "--user-agent",
+                    "--retries");
 
     /** Wydzielone z main, żeby test mógł sprawdzić treść bez przechwytywania System.out. */
     static String startMessage() {
@@ -49,6 +50,10 @@ public class Main {
                   --delay MS        przerwa po każdym żądaniu w milisekundach, żeby nie
                                     przeciążać serwera (domyślnie %d, 0 = bez przerwy)
                   --timeout MS      limit czasu jednego żądania w milisekundach (domyślnie %d)
+                  --retries N       ile razy ponowić stronę po błędzie przejściowym: timeout,
+                                    brak połączenia, HTTP 429 lub 5xx (domyślnie %d,
+                                    0 = bez ponawiania); przerwy 1, 2, 4... s, najwyżej 30 s;
+                                    każda próba liczy się do --max-pages
                   --user-agent TEKST
                                     nagłówek User-Agent, tylko drukowalne znaki ASCII
                                     (domyślnie "%s")
@@ -73,8 +78,8 @@ public class Main {
                       --user-agent "MojRobot/1.0 (+https://example.com/bot)"
                 """.formatted(CrawlerConfig.DEFAULT_THREADS, CrawlerConfig.DEFAULT_MAX_PAGES,
                 CrawlerConfig.DEFAULT_MAX_DEPTH, CrawlerConfig.DEFAULT_DELAY_MS,
-                CrawlerConfig.DEFAULT_TIMEOUT_MS, CrawlerConfig.DEFAULT_USER_AGENT,
-                CrawlerConfig.DEFAULT_DB_PATH);
+                CrawlerConfig.DEFAULT_TIMEOUT_MS, CrawlerConfig.DEFAULT_MAX_RETRIES,
+                CrawlerConfig.DEFAULT_USER_AGENT, CrawlerConfig.DEFAULT_DB_PATH);
     }
 
     /** --help ma pierwszeństwo przed walidacją: pomoc ma działać nawet przy błędnych argumentach. */
@@ -111,6 +116,7 @@ public class Main {
         int maxDepth = CrawlerConfig.DEFAULT_MAX_DEPTH;
         int delayMs = CrawlerConfig.DEFAULT_DELAY_MS;
         int timeoutMs = CrawlerConfig.DEFAULT_TIMEOUT_MS;
+        int maxRetries = CrawlerConfig.DEFAULT_MAX_RETRIES;
         String userAgent = CrawlerConfig.DEFAULT_USER_AGENT;
         boolean sameHostOnly = CrawlerConfig.DEFAULT_SAME_HOST_ONLY;
         boolean fresh = CrawlerConfig.DEFAULT_FRESH;
@@ -156,6 +162,7 @@ public class Main {
                 case "--max-depth" -> maxDepth = intValue(arg, value, 0);
                 case "--delay" -> delayMs = intValue(arg, value, 0);
                 case "--timeout" -> timeoutMs = intValue(arg, value, 1);
+                case "--retries" -> maxRetries = intValue(arg, value, 0);
                 case "--db" -> dbPath = value;
                 case "--user-agent" -> userAgent = value;
             }
@@ -165,7 +172,7 @@ public class Main {
         }
         // Adres i User-Agent sprawdza konstruktor CrawlerConfig.
         return new CrawlerConfig(startUrl, threads, maxPages, maxDepth, sameHostOnly, dbPath, fresh,
-                timeoutMs, delayMs, userAgent, respectRobots);
+                timeoutMs, delayMs, userAgent, respectRobots, maxRetries);
     }
 
     /** Wartość opcji stojącej na pozycji optionIndex, czyli następny argument. */

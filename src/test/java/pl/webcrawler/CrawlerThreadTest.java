@@ -1,18 +1,25 @@
 package pl.webcrawler;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
+import java.io.IOException;
+import java.net.ConnectException;
+import java.net.SocketTimeoutException;
+import java.net.UnknownHostException;
 import java.util.List;
 
+import org.jsoup.HttpStatusException;
 import org.jsoup.Jsoup;
+import org.jsoup.UnsupportedMimeTypeException;
 import org.jsoup.nodes.Document;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.CsvSource;
 import org.junit.jupiter.params.provider.ValueSource;
 
-/** extractLinks na HTML z pamięci - bez sieci i bez bazy. */
+/** extractLinks na HTML z pamięci i pozostałe metody statyczne - bez sieci i bez bazy. */
 class CrawlerThreadTest {
 
     private static final String BASE = "https://example.com/dir/page.html";
@@ -135,5 +142,58 @@ class CrawlerThreadTest {
             """)
     void pauseIsLongerOfDelayAndCappedCrawlDelay(int delayMs, long crawlDelayMs, long expected) {
         assertEquals(expected, CrawlerThread.pauseAfterRequestMs(delayMs, crawlDelayMs));
+    }
+
+    // ---- ponawianie ----
+
+    @ParameterizedTest(name = "HTTP {0} -> przejściowy: {1}")
+    @CsvSource(delimiter = '|', textBlock = """
+            429 | true
+            500 | true
+            502 | true
+            503 | true
+            599 | true
+            400 | false
+            403 | false
+            404 | false
+            410 | false
+            """)
+    void httpStatusIsTransientOnlyFor429And5xx(int status, boolean expected) {
+        HttpStatusException e = new HttpStatusException("HTTP error fetching URL", status, BASE);
+
+        assertEquals(expected, CrawlerThread.isTransient(e));
+    }
+
+    @Test
+    void timeoutAndRefusedConnectionAreTransient() {
+        assertTrue(CrawlerThread.isTransient(new SocketTimeoutException("Read timed out")));
+        assertTrue(CrawlerThread.isTransient(new ConnectException("Connection refused")));
+    }
+
+    @Test
+    void otherErrorsAreNotTransient() {
+        // Nieznany host czy zły typ treści nie zmienią się za kilka sekund.
+        assertFalse(CrawlerThread.isTransient(new UnknownHostException("nie-ma-takiego-hosta.pl")));
+        assertFalse(CrawlerThread.isTransient(
+                new UnsupportedMimeTypeException("Unhandled content type", "application/pdf", BASE)));
+        assertFalse(CrawlerThread.isTransient(new IOException("inny błąd")));
+        assertFalse(CrawlerThread.isTransient(new IllegalArgumentException("zły adres przekierowania")));
+    }
+
+    @ParameterizedTest(name = "po {0} próbach -> {1} ms")
+    @CsvSource(delimiter = '|', textBlock = """
+            0          | 1000
+            1          | 2000
+            2          | 4000
+            3          | 8000
+            4          | 16000
+            # 32 s - już powyżej limitu 30 s
+            5          | 30000
+            # wykładnik ograniczony - przesunięcie o >= 64 bity nie "zawija się" do krótkiej przerwy
+            64         | 30000
+            2147483647 | 30000
+            """)
+    void retryDelayDoublesUpToLimit(int attempts, long expectedMs) {
+        assertEquals(expectedMs, CrawlerThread.retryDelayMs(attempts));
     }
 }

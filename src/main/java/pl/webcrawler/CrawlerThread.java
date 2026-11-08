@@ -1,6 +1,7 @@
 package pl.webcrawler;
 
 import java.io.IOException;
+import java.net.ConnectException;
 import java.net.SocketTimeoutException;
 import java.util.ArrayList;
 import java.util.List;
@@ -8,6 +9,7 @@ import java.util.Optional;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.function.LongSupplier;
 
 import org.jsoup.HttpStatusException;
 import org.jsoup.Jsoup;
@@ -29,12 +31,19 @@ public class CrawlerThread implements Runnable {
     /** Wartość kolumny error dla linków pominiętych, bo zabrania ich robots.txt. */
     static final String ROBOTS_SKIP_REASON = "robots.txt";
 
+    /** Przerwa przed pierwszym ponowieniem; każda kolejna jest dwa razy dłuższa. */
+    static final long RETRY_BASE_DELAY_MS = 1_000;
+    /** Najdłuższa przerwa przed ponowieniem. */
+    static final long MAX_RETRY_DELAY_MS = 30_000;
+
     private final DBConn db;
     private final CrawlerConfig config;
     private final RobotsCache robots;
     private final AtomicInteger pagesFetched;
     private final AtomicBoolean stopRequested;
     private final AtomicReference<DatabaseException> dbFailure;
+    /** Bieżący czas w ms od epoki: od niego liczymy retry_at i porównujemy go z retry_at w bazie. */
+    private final LongSupplier clock;
 
     /**
      * Wszystkie wątki dostają te same obiekty db, config, robots, pagesFetched, stopRequested i dbFailure.
@@ -49,12 +58,22 @@ public class CrawlerThread implements Runnable {
      */
     public CrawlerThread(DBConn db, CrawlerConfig config, RobotsCache robots, AtomicInteger pagesFetched,
                          AtomicBoolean stopRequested, AtomicReference<DatabaseException> dbFailure) {
+        this(db, config, robots, pagesFetched, stopRequested, dbFailure, System::currentTimeMillis);
+    }
+
+    /**
+     * Tylko dla testów (pakietowo-prywatny): clock zastępuje zegar systemowy. Test przesuwa
+     * czas, zamiast czekać sekundami, aż minie przerwa przed ponowieniem.
+     */
+    CrawlerThread(DBConn db, CrawlerConfig config, RobotsCache robots, AtomicInteger pagesFetched,
+                  AtomicBoolean stopRequested, AtomicReference<DatabaseException> dbFailure, LongSupplier clock) {
         this.db = db;
         this.config = config;
         this.robots = robots;
         this.pagesFetched = pagesFetched;
         this.stopRequested = stopRequested;
         this.dbFailure = dbFailure;
+        this.clock = clock;
     }
 
     @Override
@@ -78,10 +97,11 @@ public class CrawlerThread implements Runnable {
                     log("osiągnięto limit " + config.maxPages() + " stron");
                     break;
                 }
-                Optional<LinkRecord> claimed = db.claimNextLink(workerName, config.maxDepth());
+                Optional<LinkRecord> claimed = db.claimNextLink(workerName, config.maxDepth(), clock.getAsLong());
                 if (claimed.isEmpty()) {
-                    // Brak NEW nie oznacza końca: strona IN_PROGRESS w innym wątku może
-                    // za chwilę dodać nowe linki. Kończymy dopiero, gdy nie ma ani jednych, ani drugich.
+                    // Brak linku do przejęcia nie oznacza końca: strona IN_PROGRESS w innym wątku
+                    // może za chwilę dodać nowe linki, a link NEW może czekać na termin ponowienia.
+                    // Kończymy dopiero, gdy nie ma ani jednych, ani drugich.
                     if (!db.hasPendingWork(config.maxDepth())) {
                         log("brak linków do odwiedzenia");
                         break;
@@ -159,6 +179,7 @@ public class CrawlerThread implements Runnable {
 
         // Rezerwacja miejsca tuż przed żądaniem: incrementAndGet jest atomowe, więc
         // nawet przy wielu wątkach naraz dokładnie maxPages z nich dostanie wartość <= limit.
+        // Ponowienie to też żądanie HTTP, więc rezerwuje miejsce jak pierwsza próba.
         if (pagesFetched.incrementAndGet() > config.maxPages()) {
             // Cofamy nieudaną rezerwację, żeby licznik pokazywał faktyczną liczbę żądań.
             pagesFetched.decrementAndGet();
@@ -179,11 +200,11 @@ public class CrawlerThread implements Runnable {
             log("odwiedzono " + link.url() + " (głębokość " + link.depth()
                     + ", linków: " + links.size() + ")");
         } catch (HttpStatusException e) {
-            markError(link, "HTTP " + e.getStatusCode());
+            handleFailure(link, e, "HTTP " + e.getStatusCode());
         } catch (UnsupportedMimeTypeException e) {
             markError(link, "Nieobsługiwany typ treści: " + e.getMimeType());
         } catch (SocketTimeoutException e) {
-            markError(link, "Przekroczono czas oczekiwania (" + config.timeoutMs() + " ms)");
+            handleFailure(link, e, "Przekroczono czas oczekiwania (" + config.timeoutMs() + " ms)");
         } catch (DatabaseException e) {
             // Błąd bazy nie jest błędem tej strony - przekazujemy go dalej do run().
             throw e;
@@ -197,12 +218,54 @@ public class CrawlerThread implements Runnable {
                 db.releaseLink(link.id());
                 throw new InterruptedException("Przerwano pobieranie " + link.url());
             }
-            markError(link, e.getClass().getSimpleName() + ": " + e.getMessage());
+            // Tu trafia m.in. ConnectException (serwer odrzucił połączenie) - błąd przejściowy.
+            handleFailure(link, e, e.getClass().getSimpleName() + ": " + e.getMessage());
         }
 
         // Grzeczność wobec serwera: przerwa po każdym żądaniu, także nieudanym.
         Thread.sleep(pauseAfterRequestMs(config.delayMs(), crawlDelayMs));
         return true;
+    }
+
+    /**
+     * Nieudane pobranie strony. Błąd przejściowy ponawiamy, dopóki nie wyczerpiemy --retries:
+     * link wraca do NEW, ale inny (albo ten sam) wątek przejmie go dopiero po przerwie.
+     * Pozostałe błędy i nieudana ostatnia próba kończą się statusem ERROR.
+     */
+    private void handleFailure(LinkRecord link, Exception cause, String message) {
+        if (isTransient(cause) && link.attempts() < config.maxRetries()) {
+            long delayMs = retryDelayMs(link.attempts());
+            db.scheduleRetry(link.id(), message, clock.getAsLong() + delayMs);
+            logError("błąd przejściowy " + link.url() + ": " + message + " - ponowienie "
+                    + (link.attempts() + 1) + "/" + config.maxRetries() + " za " + delayMs + " ms");
+            return;
+        }
+        int tries = link.attempts() + 1;
+        // Dopisek tylko po kilku próbach - po jednej opis wygląda jak dotąd, np. "HTTP 404".
+        markError(link, tries > 1 ? message + " (po " + tries + " próbach)" : message);
+    }
+
+    /**
+     * Błąd przejściowy - ten sam adres za chwilę może zadziałać: przekroczony czas, odrzucone
+     * połączenie (serwer chwilowo nie przyjmuje połączeń), HTTP 429 (za dużo żądań) i 5xx
+     * (błąd serwera). Pozostałe błędy (np. 404, zły typ treści) powtórzyłyby się przy każdej próbie.
+     */
+    static boolean isTransient(Exception e) {
+        if (e instanceof HttpStatusException http) {
+            int status = http.getStatusCode();
+            return status == 429 || (status >= 500 && status <= 599);
+        }
+        return e instanceof SocketTimeoutException || e instanceof ConnectException;
+    }
+
+    /**
+     * Przerwa przed ponowieniem po attempts nieudanych próbach: 1 s, 2 s, 4 s..., najwyżej 30 s.
+     * Wykładnik ograniczamy, bo w Javie przesunięcie o 64 bity i więcej "zawija się"
+     * (1L << 64 == 1) - przy dużym --retries przerwy znów byłyby krótkie.
+     */
+    static long retryDelayMs(int attempts) {
+        int exponent = Math.min(attempts, 30);
+        return Math.min(RETRY_BASE_DELAY_MS << exponent, MAX_RETRY_DELAY_MS);
     }
 
     /**

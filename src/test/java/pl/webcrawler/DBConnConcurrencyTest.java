@@ -102,7 +102,7 @@ class DBConnConcurrencyTest {
                         ready.countDown();
                         start.await();
                         Optional<LinkRecord> link;
-                        while ((link = conn.claimNextLink(worker, MAX_DEPTH)).isPresent()) {
+                        while ((link = conn.claimNextLink(worker, MAX_DEPTH, System.currentTimeMillis())).isPresent()) {
                             claims.add(new Claim(worker, link.get()));
                         }
                     } finally {

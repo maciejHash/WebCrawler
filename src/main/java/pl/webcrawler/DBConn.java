@@ -36,6 +36,15 @@ public class DBConn implements AutoCloseable {
     private static final String CREATE_INDEX =
             "CREATE INDEX IF NOT EXISTS idx_links_status_depth ON links (status, depth)";
 
+    // Ponawianie błędów przejściowych. attempts: ile prób skończyło się błędem przejściowym
+    // i ponowieniem. retry_at: od kiedy link wolno przejąć (ms od epoki, czas z Javy, a nie
+    // CURRENT_TIMESTAMP - dzięki temu test steruje czasem); NULL = od razu.
+    // ADD COLUMN z NOT NULL wymaga wartości domyślnej - istniejące wiersze dostają 0.
+    private static final String ADD_ATTEMPTS =
+            "ALTER TABLE links ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0";
+    private static final String ADD_RETRY_AT =
+            "ALTER TABLE links ADD COLUMN retry_at INTEGER";
+
     /**
      * Migracje schematu: element o indeksie i prowadzi bazę do wersji i + 1. Numer wersji
      * jest zapisany w pliku bazy (PRAGMA user_version, nowa baza ma 0).
@@ -45,7 +54,8 @@ public class DBConn implements AutoCloseable {
      * tabelę i indeks, ale zostawiały user_version = 0 - na takiej bazie niczego nie zmienia.
      */
     private static final List<List<String>> MIGRATIONS = List.of(
-            List.of(CREATE_TABLE, CREATE_INDEX)     // 1: tabela links i indeks (status, depth)
+            List.of(CREATE_TABLE, CREATE_INDEX),    // 1: tabela links i indeks (status, depth)
+            List.of(ADD_ATTEMPTS, ADD_RETRY_AT)     // 2: ponawianie - kolumny attempts i retry_at
     );
 
     /** Wersja schematu, do której createTables() doprowadza bazę: numer ostatniej migracji. */
@@ -72,12 +82,12 @@ public class DBConn implements AutoCloseable {
             "INSERT OR IGNORE INTO links (url, depth) VALUES (?, 0)";
 
     private static final String SELECT_BY_URL = """
-            SELECT id, url, depth, seen, status, claimed_by, visited_at, error
+            SELECT id, url, depth, seen, status, claimed_by, visited_at, error, attempts, retry_at
             FROM links WHERE url = ?""";
 
     // Przy równym seen decyduje id (kolejność znalezienia) - raport jest powtarzalny.
     private static final String SELECT_MOST_SEEN = """
-            SELECT id, url, depth, seen, status, claimed_by, visited_at, error
+            SELECT id, url, depth, seen, status, claimed_by, visited_at, error, attempts, retry_at
             FROM links ORDER BY seen DESC, id
             LIMIT ?""";
 
@@ -96,10 +106,13 @@ public class DBConn implements AutoCloseable {
     // w kolejce. Indeks (status, depth) przechowuje wpisy w kolejności (depth, rowid), a id
     // to rowid - SQLite czyta je w tej kolejności i nie musi sortować.
     // Pobieramy kilku naraz, żeby po przegranym wyścigu nie robić od razu nowego SELECT-a.
+    // Link czekający na ponowienie (retry_at w przyszłości) jest pomijany, ale nie blokuje
+    // kolejki - wątek bierze następny. Warunek na retry_at SQLite sprawdza na wierszach
+    // znalezionych przez indeks, więc plan zapytania się nie zmienia (dalej bez sortowania).
     private static final int CLAIM_BATCH = 20;
     private static final String SELECT_CANDIDATES = """
-            SELECT id, url, depth FROM links
-            WHERE status = 'NEW' AND depth <= ?
+            SELECT id, url, depth, attempts FROM links
+            WHERE status = 'NEW' AND depth <= ? AND (retry_at IS NULL OR retry_at <= ?)
             ORDER BY depth, id
             LIMIT ?""";
 
@@ -131,8 +144,17 @@ public class DBConn implements AutoCloseable {
             UPDATE links SET status = 'NEW', claimed_by = NULL
             WHERE id = ? AND status = 'IN_PROGRESS'""";
 
+    // Jak RELEASE_LINK, ale link wraca do kolejki dopiero od retry_at i z licznikiem prób.
+    // Warunek status = 'IN_PROGRESS': zmieniamy tylko link, który wciąż jest przejęty.
+    private static final String SCHEDULE_RETRY = """
+            UPDATE links SET status = 'NEW', attempts = attempts + 1, claimed_by = NULL,
+                             error = ?, retry_at = ?
+            WHERE id = ? AND status = 'IN_PROGRESS'""";
+
     // Jedno zapytanie, żeby odpowiedź była spójna: dwa osobne zapytania mogłyby zobaczyć
     // bazę w dwóch różnych chwilach (np. link przeszedł z NEW do IN_PROGRESS pomiędzy nimi).
+    // Celowo bez warunku na retry_at: link czekający na ponowienie to też praca do zrobienia,
+    // więc wątki czekają na niego, zamiast kończyć.
     private static final String HAS_PENDING_WORK = """
             SELECT EXISTS (
                 SELECT 1 FROM links
@@ -148,9 +170,12 @@ public class DBConn implements AutoCloseable {
 
     private static final String DROP_TABLE = "DROP TABLE IF EXISTS links";
 
-    /** Wiersz tabeli links w postaci potrzebnej do sprawdzania stanu bazy (m.in. w testach). */
+    /**
+     * Wiersz tabeli links w postaci potrzebnej do sprawdzania stanu bazy (m.in. w testach).
+     * retryAt to Long, a nie long, bo w bazie może być NULL (ponowienia nie zaplanowano).
+     */
     public record LinkRow(long id, String url, int depth, int seen, String status,
-                          String claimedBy, String visitedAt, String error) {
+                          String claimedBy, String visitedAt, String error, int attempts, Long retryAt) {
     }
 
     private final String dbPath;
@@ -295,11 +320,14 @@ public class DBConn implements AutoCloseable {
      * przez UPSERT), a przy równej głębokości najstarszy link (najmniejsze id).
      * Link należy do wątku tylko wtedy, gdy warunkowy UPDATE zmienił wiersz; przy 0
      * (link właśnie przejęło inne połączenie) próbujemy kolejnego kandydata.
+     *
+     * @param nowMs bieżący czas w ms od epoki; link z retry_at > nowMs czeka jeszcze na ponowienie.
+     *              Czas podaje wywołujący, a nie baza, żeby test mógł nim sterować
      */
-    public synchronized Optional<LinkRecord> claimNextLink(String workerName, int maxDepth) {
+    public synchronized Optional<LinkRecord> claimNextLink(String workerName, int maxDepth, long nowMs) {
         try {
             while (true) {
-                List<LinkRecord> candidates = selectCandidates(maxDepth);
+                List<LinkRecord> candidates = selectCandidates(maxDepth, nowMs);
                 if (candidates.isEmpty()) {
                     return Optional.empty();
                 }
@@ -388,8 +416,25 @@ public class DBConn implements AutoCloseable {
     }
 
     /**
+     * Błąd przejściowy: link wraca z IN_PROGRESS do NEW, ale przejąć go można dopiero
+     * od retryAtMs. attempts rośnie o 1, a w error zostaje ostatni błąd.
+     * Link w innym statusie niż IN_PROGRESS zostaje bez zmian.
+     */
+    public synchronized void scheduleRetry(long id, String error, long retryAtMs) {
+        try (PreparedStatement stmt = openConnection().prepareStatement(SCHEDULE_RETRY)) {
+            stmt.setString(1, error);
+            stmt.setLong(2, retryAtMs);
+            stmt.setLong(3, id);
+            stmt.executeUpdate();
+        } catch (SQLException e) {
+            throw new DatabaseException("Nie można zaplanować ponowienia linku: " + id, e);
+        }
+    }
+
+    /**
      * Czy jest jeszcze praca: link w trakcie odwiedzania (może dodać nowe linki)
-     * albo link NEW w dozwolonej głębokości.
+     * albo link NEW w dozwolonej głębokości - także czekający na ponowienie. Dlatego
+     * metoda nie potrzebuje bieżącego czasu: termin ponowienia nie zmienia odpowiedzi.
      */
     public synchronized boolean hasPendingWork(int maxDepth) {
         try (PreparedStatement stmt = openConnection().prepareStatement(HAS_PENDING_WORK)) {
@@ -496,15 +541,16 @@ public class DBConn implements AutoCloseable {
      * inne połączenie coś zapisało, nasz UPDATE dostałby od razu SQLITE_BUSY
      * (busy_timeout tu nie pomaga, bo czekanie nie odświeży starego obrazu).
      */
-    private List<LinkRecord> selectCandidates(int maxDepth) throws SQLException {
+    private List<LinkRecord> selectCandidates(int maxDepth, long nowMs) throws SQLException {
         List<LinkRecord> candidates = new ArrayList<>();
         try (PreparedStatement stmt = openConnection().prepareStatement(SELECT_CANDIDATES)) {
             stmt.setInt(1, maxDepth);
-            stmt.setInt(2, CLAIM_BATCH);
+            stmt.setLong(2, nowMs);
+            stmt.setInt(3, CLAIM_BATCH);
             try (ResultSet rs = stmt.executeQuery()) {
                 while (rs.next()) {
-                    candidates.add(new LinkRecord(
-                            rs.getLong("id"), rs.getString("url"), rs.getInt("depth")));
+                    candidates.add(new LinkRecord(rs.getLong("id"), rs.getString("url"),
+                            rs.getInt("depth"), rs.getInt("attempts")));
                 }
             }
         }
@@ -521,6 +567,10 @@ public class DBConn implements AutoCloseable {
     }
 
     private static LinkRow toLinkRow(ResultSet rs) throws SQLException {
+        // getLong zamienia NULL na 0 - wasNull() mówi, czy w kolumnie naprawdę było NULL.
+        // (getObject(..., Long.class) byłby krótszy, ale sqlite-jdbc rzuca przy nim wyjątek dla NULL.)
+        long retryAtValue = rs.getLong("retry_at");
+        Long retryAt = rs.wasNull() ? null : retryAtValue;
         return new LinkRow(
                 rs.getLong("id"),
                 rs.getString("url"),
@@ -529,7 +579,9 @@ public class DBConn implements AutoCloseable {
                 rs.getString("status"),
                 rs.getString("claimed_by"),
                 rs.getString("visited_at"),
-                rs.getString("error"));
+                rs.getString("error"),
+                rs.getInt("attempts"),
+                retryAt);
     }
 
     /** Wspólny kod dla UPDATE-ów, których jedynym parametrem jest id. */

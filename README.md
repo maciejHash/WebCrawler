@@ -9,7 +9,8 @@ Wielowątkowy robot internetowy w Javie, który przegląda strony WWW i zapisuje
 - wszystkie linki ze strony trafiają do bazy, a powtórne znalezienie zwiększa licznik `seen`,
 - żadna strona nie jest pobierana dwa razy - pilnuje tego baza danych,
 - przerwaną pracę można wznowić, bo cały stan jest w pliku bazy,
-- respektuje `robots.txt` (w tym `Crawl-delay`) i meta tag `robots` z `nofollow`.
+- respektuje `robots.txt` (w tym `Crawl-delay`) i meta tag `robots` z `nofollow`,
+- ponawia strony z błędem przejściowym (timeout, odrzucone połączenie, HTTP 429 i 5xx).
 
 ## Wymagania
 
@@ -51,6 +52,7 @@ mvn -q compile exec:java -Dexec.args="https://books.toscrape.com --max-pages 20"
 | `--max-depth N` | `3` | Maksymalna głębokość; strona startowa ma 0, linki z niej 1 itd. (`N >= 0`). |
 | `--delay MS` | `500` | Przerwa po każdym żądaniu (także nieudanym), żeby nie przeciążać serwera; `0` = bez przerwy. Przerwę robi każdy wątek osobno. Gdy `robots.txt` hosta podaje dłuższy `Crawl-delay`, obowiązuje on (najwyżej 10 s) - patrz [Crawl-delay](#crawl-delay). |
 | `--timeout MS` | `10000` | Limit czasu jednego żądania HTTP w milisekundach (`MS >= 1`). Strona, która nie odpowie w tym czasie, dostaje status `ERROR`. Od tej wartości zależy też, jak długo Ctrl+C czeka na zakończenie wątków. |
+| `--retries N` | `2` | Ile razy ponowić stronę po błędzie przejściowym: przekroczony czas, odrzucone połączenie, HTTP 429 lub 5xx (`N >= 0`; `0` = bez ponawiania). Przerwy przed kolejnymi próbami: 1, 2, 4... s, najwyżej 30 s. Każda próba liczy się do `--max-pages`. Patrz [Ponawianie](#ponawianie-błędów-przejściowych). |
 | `--user-agent TEKST` | `pl.webcrawler/<wersja> (student project)` | Nagłówek `User-Agent` wysyłany z każdym żądaniem. Niepusty, tylko drukowalne znaki ASCII (od spacji do `~`) - polskie litery, tabulator czy znak nowej linii kończą program błędem. Wartość ze spacjami trzeba ująć w cudzysłów. |
 | `--all-hosts` | wyłączone | Odwiedzaj też strony z innych hostów. Domyślnie tylko host startowy (`www.` i wielkość liter są pomijane). Linki do innych hostów i tak trafiają do bazy, a po przejęciu przez wątek dostają status `SKIPPED`. |
 | `--ignore-robots` | wyłączone | Nie pobiera `robots.txt` i odwiedza także strony, których zabrania; `Crawl-delay` też nie obowiązuje. Meta tag `robots` z `nofollow` jest respektowany zawsze. Patrz [robots.txt](#robotstxt). |
@@ -70,11 +72,51 @@ Każda opcja może wystąpić najwyżej raz. Błędne argumenty kończą program
   2 × `--timeout` (`robots.txt` i strona) + dłuższa z wartości `--delay` i 10 s (`Crawl-delay`) + 5 s;
   z `--ignore-robots` - `--timeout` + `--delay` + 5 s.
 - Limit `--max-pages` liczy strony tylko z bieżącego uruchomienia, więc można wznawiać pracę porcjami.
+- Link czekający na ponowienie zachowuje przy wznowieniu liczbę prób i termin ponowienia.
 
 ### Raport
 
 Na końcu program wypisuje raport: liczbę linków w każdym statusie, 10 najczęściej
 znajdowanych linków, liczbę stron pobranych przez każdy wątek i czas trwania.
+
+## Ponawianie błędów przejściowych
+
+Niektóre błędy mijają same: serwer jest chwilowo przeciążony albo restartowany. Takie strony robot
+ponawia, zamiast od razu oznaczać je jako `ERROR`. O tym, który błąd jest przejściowy, decyduje
+`CrawlerThread.isTransient`:
+
+| Błąd | Przejściowy? |
+|---|---|
+| Przekroczony czas (`SocketTimeoutException`) | tak |
+| Odrzucone połączenie (`ConnectException`) | tak |
+| HTTP 429 (za dużo żądań) i 5xx (błąd serwera) | tak |
+| Pozostałe kody HTTP (np. 404, 403), zły typ treści, nieznany host, inne wyjątki | nie - od razu `ERROR` |
+
+Po błędzie przejściowym, jeśli strona nie wykorzystała jeszcze `--retries` ponowień, `DBConn.scheduleRetry`
+oddaje link do kolejki - jednym warunkowym `UPDATE`-em:
+
+```sql
+UPDATE links SET status = 'NEW', attempts = attempts + 1, claimed_by = NULL,
+                 error = ?, retry_at = ?
+WHERE id = ? AND status = 'IN_PROGRESS';
+```
+
+- `attempts` - ile prób skończyło się błędem przejściowym i ponowieniem, `error` - opis ostatniego błędu,
+  `retry_at` - od kiedy link wolno przejąć (ms od epoki).
+- Przerwa przed ponowieniem to 2^`attempts` s: 1 s, 2 s, 4 s, 8 s, 16 s, a dalej 30 s.
+- Wątek nie śpi przez tę przerwę - od razu bierze następny link. Link czekający na ponowienie przejmie
+  pierwszy wątek, który zapyta o pracę po `retry_at` (może to być inny wątek niż poprzednio).
+- Każda próba to żądanie HTTP, więc zajmuje miejsce w `--max-pages` i jest liczona w raporcie.
+- Gdy ponowienia się skończą, strona dostaje `ERROR` z liczbą wszystkich prób, np. `HTTP 503 (po 3 próbach)`.
+  Błąd po jednej próbie (np. 404 albo przejściowy przy `--retries 0`) ma opis jak dotąd: `HTTP 404`.
+- Udana próba daje zwykłe `VISITED`, a `error` jest czyszczony; `attempts` zostaje jako informacja.
+- Linki czekające na ponowienie są dla `hasPendingWork` pracą do wykonania - wątki czekają na nie
+  (co 200 ms sprawdzają bazę), zamiast kończyć. Przy wyczerpanym `--max-pages` albo po Ctrl+C link zostaje
+  `NEW` z zapisanym `attempts` i `retry_at`; `resetInProgress` go nie zmienia, więc przy wznowieniu
+  liczba prób jest kontynuowana.
+
+Bieżący czas podaje Java (`System.currentTimeMillis()`), a nie SQLite. Testy przekazują do `CrawlerThread`
+własny zegar (pakietowo-prywatny konstruktor z `LongSupplier`), więc przesuwają czas, zamiast czekać sekundami.
 
 ## robots.txt
 
@@ -172,11 +214,11 @@ Wszystkie klasy są w pakiecie `pl.webcrawler`.
 | `Main` | Parsowanie argumentów, uruchomienie `Crawler`, shutdown hook dla Ctrl+C, wypisanie raportu. |
 | `CrawlerConfig` | Record z ustawieniami uruchomienia; sprawdza wartości i normalizuje adres startowy. |
 | `Crawler` | Przygotowuje bazę, tworzy pulę wątków (`Executors.newFixedThreadPool`), czeka na koniec, zbiera statystyki. |
-| `CrawlerThread` | `Runnable` - pętla: przejmij link → sprawdź `robots.txt` → pobierz stronę → wyciągnij linki → zapisz je → oznacz stronę. |
+| `CrawlerThread` | `Runnable` - pętla: przejmij link → sprawdź `robots.txt` → pobierz stronę → wyciągnij linki → zapisz je → oznacz stronę (albo zaplanuj ponowienie po błędzie przejściowym). |
 | `RobotsTxt` | Reguły z `robots.txt` dla naszego robota: wybór grupy, `Allow`/`Disallow` (najdłuższe dopasowanie, `*`, `$`), `Crawl-delay`. Sama logika, bez sieci. |
 | `RobotsCache` | Pobiera `robots.txt` każdego hosta najwyżej raz na uruchomienie; jedna instancja wspólna dla wątków. |
 | `DBConn` | Cały SQL; jedna instancja współdzielona przez wątki, metody publiczne `synchronized`. |
-| `LinkRecord` | Record `(id, url, depth)` - link przejęty przez wątek. |
+| `LinkRecord` | Record `(id, url, depth, attempts)` - link przejęty przez wątek. |
 | `AppVersion` | Wersja programu wczytana z `webcrawler-version.properties` (wartość zapasowa `dev`). |
 | `UrlUtils` | Normalizacja adresów, porównywanie hostów, rozpoznawanie plików binarnych. |
 | `DatabaseException` | Niekontrolowany wyjątek opakowujący `SQLException`. |
@@ -187,7 +229,10 @@ Wątki nazywają się `crawler-1`, `crawler-2`, ... - ta nazwa jest w każdej li
 
 ### Tabela `links`
 
+Schemat po wszystkich migracjach (patrz [Wersje schematu](#wersje-schematu)):
+
 ```sql
+-- migracja 1
 CREATE TABLE IF NOT EXISTS links (
     id         INTEGER PRIMARY KEY AUTOINCREMENT,
     url        TEXT    NOT NULL UNIQUE,
@@ -201,6 +246,10 @@ CREATE TABLE IF NOT EXISTS links (
 );
 
 CREATE INDEX IF NOT EXISTS idx_links_status_depth ON links (status, depth);
+
+-- migracja 2
+ALTER TABLE links ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE links ADD COLUMN retry_at INTEGER;
 ```
 
 | Kolumna | Znaczenie |
@@ -213,7 +262,9 @@ CREATE INDEX IF NOT EXISTS idx_links_status_depth ON links (status, depth);
 | `claimed_by` | Nazwa wątku, który przejął link; zostaje po zakończeniu, stąd statystyka stron na wątek. |
 | `found_at` | Kiedy link pierwszy raz trafił do bazy (UTC). |
 | `visited_at` | Kiedy link otrzymał status końcowy (UTC). |
-| `error` | Opis błędu dla statusu `ERROR`, np. `HTTP 404`, albo powód pominięcia dla `SKIPPED` (`robots.txt`). |
+| `error` | Opis błędu dla statusu `ERROR`, np. `HTTP 404` albo `HTTP 503 (po 3 próbach)`, powód pominięcia dla `SKIPPED` (`robots.txt`), a dla linku `NEW` czekającego na ponowienie - ostatni błąd przejściowy. |
+| `attempts` | Ile prób skończyło się błędem przejściowym i ponowieniem (`scheduleRetry`); domyślnie 0. |
+| `retry_at` | Od kiedy link `NEW` wolno przejąć, w ms od epoki (czas z Javy); `NULL` - od razu. Po przejęciu wartość zostaje, ale nie ma już znaczenia. |
 
 Indeks na `(status, depth)` przyspiesza najczęstsze zapytanie: „daj linki `NEW` o głębokości do `maxDepth`,
 od najpłytszych” - i od razu podaje je w tej kolejności (patrz [punkt 2](#2-przejęcie-linku-warunkowym-update)).
@@ -228,18 +279,20 @@ stateDiagram-v2
     IN_PROGRESS --> ERROR: markError
     IN_PROGRESS --> SKIPPED: markSkipped (obcy host, plik binarny, robots.txt)
     IN_PROGRESS --> NEW: releaseLink / resetInProgress
+    IN_PROGRESS --> NEW: scheduleRetry (błąd przejściowy, attempts + 1, retry_at)
 ```
 
 | Status | Znaczenie |
 |---|---|
-| `NEW` | Znaleziony, czeka na odwiedzenie. Linki z `depth > maxDepth` zostają `NEW` na zawsze (albo do uruchomienia z większym `--max-depth`). |
+| `NEW` | Znaleziony, czeka na odwiedzenie - albo na ponowienie, jeśli `retry_at` jest w przyszłości. Linki z `depth > maxDepth` zostają `NEW` na zawsze (albo do uruchomienia z większym `--max-depth`). |
 | `IN_PROGRESS` | Przejęty przez wątek (`claimed_by`), który właśnie go przetwarza. |
 | `VISITED` | Strona pobrana, linki z niej zapisane. |
-| `ERROR` | Obsługa strony się nie powiodła: kod HTTP 4xx/5xx, typ treści inny niż HTML/XML, przekroczony czas, błąd sieci albo inny nieoczekiwany wyjątek (wtedy w `error` jest nazwa klasy i komunikat). Opis w `error`. |
+| `ERROR` | Obsługa strony się nie powiodła: kod HTTP 4xx/5xx, typ treści inny niż HTML/XML, przekroczony czas, błąd sieci albo inny nieoczekiwany wyjątek (wtedy w `error` jest nazwa klasy i komunikat). Błędy przejściowe dostają `ERROR` dopiero po wyczerpaniu `--retries`. Opis w `error`. |
 | `SKIPPED` | Pominięty bez żądania HTTP: inny host (bez `--all-hosts`), plik binarny po rozszerzeniu (`.pdf`, `.jpg`, `.zip`, ...) albo strona zabroniona w `robots.txt` - wtedy w `error` jest `robots.txt` (patrz [robots.txt](#robotstxt)). |
 
 Link wraca z `IN_PROGRESS` do `NEW`, gdy wątek oddaje go po wyczerpaniu limitu stron, przerwaniu
-lub błędzie bazy (`releaseLink`) albo przy starcie programu po przerwanym uruchomieniu (`resetInProgress`).
+lub błędzie bazy (`releaseLink`), przy starcie programu po przerwanym uruchomieniu (`resetInProgress`)
+albo po błędzie przejściowym (`scheduleRetry` - wtedy z terminem `retry_at`, patrz [Ponawianie](#ponawianie-błędów-przejściowych)).
 
 ### Wersje schematu
 
@@ -250,6 +303,7 @@ Numer wersji schematu jest zapisany w samym pliku bazy (`PRAGMA user_version`; n
 |---|---|
 | 0 | Pusty plik albo baza z wersji programu sprzed wersjonowania. |
 | 1 | Tabela `links` i indeks `idx_links_status_depth`. |
+| 2 | Kolumny `attempts` (`INTEGER NOT NULL DEFAULT 0`) i `retry_at` (`INTEGER`, `NULL`) do ponawiania błędów przejściowych. Istniejące wiersze dostają 0 prób i brak terminu. |
 
 `createTables()` odczytuje `user_version` i wykonuje po kolei brakujące migracje. Każda migracja razem
 z ustawieniem nowego `user_version` to osobna transakcja, więc przerwanie programu nie zostawi migracji
@@ -268,6 +322,7 @@ sqlite3 crawler.db "SELECT status, COUNT(*) FROM links GROUP BY status;"
 sqlite3 crawler.db "SELECT url, seen FROM links ORDER BY seen DESC LIMIT 10;"
 sqlite3 crawler.db "SELECT url, error FROM links WHERE status = 'ERROR';"
 sqlite3 crawler.db "SELECT url FROM links WHERE status = 'SKIPPED' AND error = 'robots.txt';"
+sqlite3 crawler.db "SELECT url, attempts, error, datetime(retry_at / 1000, 'unixepoch') FROM links WHERE status = 'NEW' AND retry_at IS NOT NULL;"
 sqlite3 crawler.db "PRAGMA user_version;"
 ```
 
@@ -279,9 +334,9 @@ flowchart TD
     stop -- tak --> finish([koniec wątku])
     stop -- nie --> limit{"pagesFetched >= maxPages?"}
     limit -- tak --> finish
-    limit -- nie --> claim["db.claimNextLink()<br/>NEW → IN_PROGRESS"]
+    limit -- nie --> claim["db.claimNextLink(now)<br/>NEW (retry_at ≤ now) → IN_PROGRESS"]
     claim --> claimed{przejęto link?}
-    claimed -- nie --> pending{"db.hasPendingWork()<br/>są IN_PROGRESS lub NEW?"}
+    claimed -- nie --> pending{"db.hasPendingWork()<br/>są IN_PROGRESS lub NEW?<br/>(także czekające na ponowienie)"}
     pending -- nie --> finish
     pending -- tak --> wait["sleep 200 ms"] --> stop
     claimed -- tak --> skip{"obcy host<br/>lub plik binarny?"}
@@ -293,8 +348,11 @@ flowchart TD
     reserve -- nie --> fetch["Jsoup.connect(url).get()"]
     fetch -- sukces --> extract["extractLinks()<br/>absUrl + UrlUtils.normalize<br/>(pusta lista przy meta robots nofollow)"]
     extract --> visited["db.saveVisitedPage()<br/>jedna transakcja: UPSERT linków (depth + 1)<br/>+ status VISITED"]
-    fetch -- "HTTP 4xx/5xx, timeout, zły typ,<br/>błąd sieci, inny RuntimeException" --> error["db.markError()<br/>klasa + komunikat"]
+    fetch -- "HTTP 4xx/5xx, timeout, zły typ,<br/>błąd sieci, inny RuntimeException" --> transient{"błąd przejściowy<br/>i attempts #lt; maxRetries?"}
+    transient -- tak --> retry["db.scheduleRetry()<br/>IN_PROGRESS → NEW, attempts + 1<br/>retry_at = now + 2^attempts s (≤ 30 s)"]
+    transient -- nie --> error["db.markError()<br/>opis + (po N próbach)"]
     visited --> delay["sleep max(delayMs, Crawl-delay)<br/>Crawl-delay najwyżej 10 s"]
+    retry --> delay
     error --> delay
     delay --> stop
     dberr(["DatabaseException<br/>w dowolnym kroku"]) --> dbstop["db.releaseLink() - błąd ignorowany<br/>zapisz pierwszy błąd dla Crawlera<br/>stopRequested = true"]
@@ -354,9 +412,10 @@ INSERT OR IGNORE INTO links (url, depth) VALUES (?, 0)
 ### 2. Przejęcie linku warunkowym `UPDATE`
 
 ```sql
--- kandydaci: linki NEW w dozwolonej głębokości, najpierw najpłytsze (po 20 naraz)
-SELECT id, url, depth FROM links
-WHERE status = 'NEW' AND depth <= ?
+-- kandydaci: linki NEW w dozwolonej głębokości, którym minął termin ponowienia,
+-- najpierw najpłytsze (po 20 naraz)
+SELECT id, url, depth, attempts FROM links
+WHERE status = 'NEW' AND depth <= ? AND (retry_at IS NULL OR retry_at <= ?)
 ORDER BY depth, id
 LIMIT ?;
 
@@ -386,6 +445,11 @@ którym w tej tabeli jest `id`. `EXPLAIN QUERY PLAN` pokazuje samo wyszukiwanie 
 ```
 SEARCH links USING INDEX idx_links_status_depth (status=? AND depth<?)
 ```
+
+Warunek na `retry_at` nie zmienia planu: SQLite sprawdza go na wierszach znalezionych przez indeks. Jest w SQL,
+a nie w Javie, więc `LIMIT` liczy tylko linki, które wolno przejąć - nawet 20 czekających linków na początku
+kolejki nie zablokuje pozostałych. Osobny indeks na `retry_at` nie jest potrzebny, bo czekających linków jest
+zwykle niewiele. Bieżący czas (`?` w warunku) podaje Java - patrz [Ponawianie](#ponawianie-błędów-przejściowych).
 
 ### 3. Jedno współdzielone połączenie, metody `synchronized`
 
@@ -457,7 +521,9 @@ SELECT EXISTS (
 ```
 
 Jedno zapytanie zamiast dwóch, bo dwa osobne mogłyby zobaczyć bazę w dwóch różnych chwilach.
-Jeśli praca jeszcze jest (inny wątek przetwarza stronę i może dodać linki), wątek czeka 200 ms.
+Jeśli praca jeszcze jest (inny wątek przetwarza stronę i może dodać linki albo link czeka na ponowienie),
+wątek czeka 200 ms. Zapytanie celowo nie sprawdza `retry_at` - link czekający na ponowienie jest `NEW`,
+więc liczy się jako praca, a wątki nie kończą się przed jego ostatnią próbą.
 To czekanie zawsze się kończy, bo każdy link `IN_PROGRESS` dostaje status końcowy albo wraca do `NEW`
 także wtedy, gdy przy jego obsłudze poleci wyjątek (patrz [Wyjątki w wątku](#wyjątki-w-wątku)).
 Wątek kończy pracę również wtedy, gdy ustawiono `stopRequested` (Ctrl+C albo błąd bazy w dowolnym wątku).
@@ -465,6 +531,7 @@ Wątek kończy pracę również wtedy, gdy ustawiono `stopRequested` (Ctrl+C alb
 Limit `--max-pages` to jeden `AtomicInteger` wspólny dla wszystkich wątków. Miejsce jest rezerwowane
 przez `incrementAndGet()` tuż przed żądaniem HTTP - operacja atomowa, więc dokładnie `maxPages` wątków
 dostanie wartość mieszczącą się w limicie. Wątek, który się nie zmieścił, cofa licznik i oddaje link do `NEW`.
+Ponowienie po błędzie przejściowym to też żądanie HTTP, więc rezerwuje miejsce tak samo jak pierwsza próba.
 
 ## Testy
 
@@ -480,13 +547,13 @@ lokalny `com.sun.net.httpserver.HttpServer` z JDK.
 | `UrlUtilsTest` | Normalizacja, porównywanie hostów, pliki binarne, ścieżka z query porównywana z `robots.txt`. |
 | `RobotsTxtTest` | Parsowanie `robots.txt` (testy parametryzowane): wybór grupy, najdłuższe dopasowanie i remis, `*` i `$`, pusty `Disallow`, `Crawl-delay`, śmieci w pliku (BOM, CRLF, komentarze, nieznane dyrektywy, linie bez dwukropka). |
 | `RobotsCacheTest` | Pobieranie `robots.txt` z lokalnego serwera: 200, 4xx, 5xx, timeout, błąd sieci, przerwanie wątku; przy 8 wątkach naraz plik pobrany raz, osobno dla każdego portu (licznik żądań). |
-| `CrawlerThreadTest` | `extractLinks` na HTML z pamięci, meta tag `robots` (`nofollow`, `none`), przerwa po żądaniu (`--delay` i ograniczony `Crawl-delay`). |
-| `DBConnTest` | Każda metoda `DBConn` na pliku SQLite w katalogu tymczasowym, w tym kolejność przejmowania (najpłytsze linki pierwsze, także po zmniejszeniu `depth`), `markSkipped` z powodem i migracje schematu (nowa baza, baza sprzed wersjonowania, baza z nowszej wersji, `dropTables`). |
+| `CrawlerThreadTest` | `extractLinks` na HTML z pamięci, meta tag `robots` (`nofollow`, `none`), przerwa po żądaniu (`--delay` i ograniczony `Crawl-delay`), które błędy są przejściowe (`isTransient`) i przerwy przed ponowieniem (`retryDelayMs`, także dla bardzo dużej liczby prób). |
+| `DBConnTest` | Każda metoda `DBConn` na pliku SQLite w katalogu tymczasowym, w tym kolejność przejmowania (najpłytsze linki pierwsze, także po zmniejszeniu `depth`), `markSkipped` z powodem, `scheduleRetry` i przejmowanie z `retry_at` (termin co do milisekundy, czekające linki nie blokują kolejki, przetrwanie restartu) oraz migracje schematu (nowa baza, baza sprzed wersjonowania, baza w wersji 1 z danymi, baza z nowszej wersji, `dropTables`). |
 | `DBConnConcurrencyTest` | 8 wątków przejmuje 200 linków - każdy link trafia do dokładnie jednego wątku (wspólne i osobne połączenia, test powtarzany). |
-| `CrawlerThreadRunTest` | Cała pętla `run()` na lokalnej stronie: statusy, `seen`, limit stron, zatrzymanie, `Crawl-delay` jako przerwa, przerwanie w trakcie pobierania `robots.txt` (link wraca do `NEW`). |
+| `CrawlerThreadRunTest` | Cała pętla `run()` na lokalnej stronie: statusy, `seen`, limit stron, zatrzymanie, `Crawl-delay` jako przerwa, przerwanie w trakcie pobierania `robots.txt` (link wraca do `NEW`). Ponawianie ze sterowanym zegarem: 503 dwa razy, potem 200 → `VISITED` po 3 żądaniach; 404 → `ERROR` po 1 żądaniu; `--retries 0`; ciągłe 503 → `ERROR` z liczbą prób; ponowienia wliczane do `--max-pages`; wątek czeka na termin ponowienia, zamiast kończyć. |
 | `CrawlerTest`, `CrawlerEndToEndTest` | Cały robot z pulą wątków: każda strona pobrana dokładnie raz (licznik żądań po stronie serwera), cykle, duplikaty, 404, wznowienie; `robots.txt` pobrany raz, strona zabroniona → `SKIPPED` z `error = 'robots.txt'` bez żądania, `--ignore-robots`, strona z meta `nofollow`. |
 | `CrawlerFailureTest` | Wyjątki w wątkach (podklasa `DBConn` rzucająca z `saveVisitedPage`): nieoczekiwany błąd strony daje `ERROR` i nie zawiesza robota, `DatabaseException` wychodzi z `Crawler.run()`, a link wraca do `NEW`. |
-| `MainTest` | Parsowanie argumentów (w tym granice `--timeout`, znaki w `--user-agent` i `--ignore-robots`), pomoc, `--version`, wersja w komunikacie startowym i domyślnym User-Agent, czas czekania po Ctrl+C, tekst raportu. |
+| `MainTest` | Parsowanie argumentów (w tym granice `--timeout` i `--retries`, znaki w `--user-agent` i `--ignore-robots`), pomoc, `--version`, wersja w komunikacie startowym i domyślnym User-Agent, czas czekania po Ctrl+C, tekst raportu. |
 | `AppVersionTest` | Wersja z przefiltrowanego zasobu; `dev`, gdy pliku brak albo nie był filtrowany. |
 
 GitHub Actions (`.github/workflows/ci.yml`) uruchamia `mvn -B verify` na JDK 27 przy każdym pushu
@@ -518,6 +585,10 @@ Program uruchomiony bez Mavena (np. sama kompilacja w IDE) pokazuje wersję `dev
   przekierowujące na tę samą stronę (np. `/a` i `/a/`) to dwa wiersze i dwa pobrania. Normalizacja nie
   zna też `<link rel="canonical">`, kolejności parametrów w query stringu ani końcowego `/`.
 - **Przerwa `--delay` i `Crawl-delay` jest na wątek, nie na serwer** - przy 4 wątkach serwer dostaje do 4 żądań w czasie jednej przerwy.
+- **Ponawianie bez `Retry-After`.** Nagłówek, w którym serwer (zwykle przy 429 i 503) podaje, kiedy wrócić,
+  jest pomijany - przerwy wynikają tylko z liczby prób (1, 2, 4... s, najwyżej 30 s). Przerwy są osobne
+  dla każdego linku, więc gdy cały serwer ma awarię, robot ponawia naraz wiele jego stron. Nieznany host
+  (`UnknownHostException`) nie jest uznawany za błąd przejściowy, choć bywa nim chwilowa awaria DNS.
 - **Pliki binarne rozpoznawane po rozszerzeniu.** `/pobierz.php?f=a.pdf` zostanie pobrany; jsoup odrzuci go
   dopiero po nagłówku `Content-Type` (status `ERROR`).
 - **Kolejność wszerz przy kilku wątkach.** Wątek bierze najpłytszy link `NEW` dostępny w chwili przejęcia,
@@ -533,6 +604,5 @@ Program uruchomiony bez Mavena (np. sama kompilacja w IDE) pokazuje wersję `dev
 
 - Wspólny limit tempa na host zamiast przerwy w każdym wątku.
 - Zapisywanie adresu docelowego po przekierowaniu i `rel="canonical"`, żeby wykrywać kolejne duplikaty.
-- Ponawianie stron z błędem przejściowym (timeout, HTTP 5xx) z ograniczoną liczbą prób.
 - Odczyt `sitemap.xml` jako dodatkowego źródła linków.
 - Eksport wyników (CSV, graf linków między stronami - wymagałby tabeli krawędzi).

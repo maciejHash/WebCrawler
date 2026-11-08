@@ -16,10 +16,12 @@ package pl.webcrawler;
  * @param delayMs      przerwa po każdym żądaniu, żeby nie przeciążać serwera
  * @param userAgent    nagłówek User-Agent wysyłany z każdym żądaniem
  * @param respectRobots czy pobierać robots.txt każdego hosta i pomijać strony, których zabrania
+ * @param maxRetries   ile razy ponowić stronę po błędzie przejściowym (timeout, brak połączenia,
+ *                     HTTP 429 i 5xx); 0 = bez ponawiania
  */
 public record CrawlerConfig(String startUrl, int threads, int maxPages, int maxDepth,
                             boolean sameHostOnly, String dbPath, boolean fresh, int timeoutMs,
-                            int delayMs, String userAgent, boolean respectRobots) {
+                            int delayMs, String userAgent, boolean respectRobots, int maxRetries) {
 
     public static final int DEFAULT_THREADS = 4;
     public static final int DEFAULT_MAX_PAGES = 100;
@@ -33,6 +35,7 @@ public record CrawlerConfig(String startUrl, int threads, int maxPages, int maxD
     // Tylko drukowalne ASCII - nagłówki HTTP nie powinny zawierać innych znaków (sprawdza konstruktor).
     public static final String DEFAULT_USER_AGENT = "pl.webcrawler/" + AppVersion.get() + " (student project)";
     public static final boolean DEFAULT_RESPECT_ROBOTS = true;
+    public static final int DEFAULT_MAX_RETRIES = 2;
     /**
      * Górny limit Crawl-delay z robots.txt. Plik pisze właściciel serwera, nie użytkownik - wartość
      * typu "Crawl-delay: 3600" zatrzymałaby wątek na godzinę po każdej stronie i opóźniła Ctrl+C.
@@ -57,6 +60,7 @@ public record CrawlerConfig(String startUrl, int threads, int maxPages, int maxD
         requireAtLeast("maxDepth", maxDepth, 0);
         requireAtLeast("timeoutMs", timeoutMs, 1);
         requireAtLeast("delayMs", delayMs, 0);
+        requireAtLeast("maxRetries", maxRetries, 0);
         if (dbPath == null || dbPath.isBlank()) {
             throw new IllegalArgumentException("Brak ścieżki do bazy");
         }

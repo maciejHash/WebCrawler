@@ -27,6 +27,24 @@ import org.junit.jupiter.api.io.TempDir;
 class DBConnTest {
 
     private static final String URL = "https://example.com/";
+    /** Dowolny "bieżący czas" dla claimNextLink - test sam decyduje, która jest godzina. */
+    private static final long NOW = 1_700_000_000_000L;
+
+    /** Tabela links w wersji schematu 1 (i sprzed wersjonowania) - bez attempts i retry_at. */
+    private static final String SCHEMA_V1_TABLE = """
+            CREATE TABLE links (
+                id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                url        TEXT    NOT NULL UNIQUE,
+                depth      INTEGER NOT NULL,
+                seen       INTEGER NOT NULL DEFAULT 1,
+                status     TEXT    NOT NULL DEFAULT 'NEW',
+                claimed_by TEXT,
+                found_at   TEXT DEFAULT CURRENT_TIMESTAMP,
+                visited_at TEXT,
+                error      TEXT
+            )""";
+    private static final String SCHEMA_V1_INDEX =
+            "CREATE INDEX idx_links_status_depth ON links (status, depth)";
 
     @TempDir
     Path tempDir;
@@ -60,7 +78,7 @@ class DBConnTest {
     void addSeedLeavesExistingLinkUntouched() {
         db.insertRow(URL, 0);
         db.insertRow(URL, 0);
-        long id = db.claimNextLink("crawler-1", 5).orElseThrow().id();
+        long id = db.claimNextLink("crawler-1", 5, NOW).orElseThrow().id();
         db.markVisited(id);
 
         assertFalse(db.addSeed(URL));
@@ -142,19 +160,8 @@ class DBConnTest {
         // ale user_version nikt nie ustawił, więc wynosi 0.
         Path file = tempDir.resolve("old.db");
         executeRaw(file,
-                """
-                CREATE TABLE links (
-                    id         INTEGER PRIMARY KEY AUTOINCREMENT,
-                    url        TEXT    NOT NULL UNIQUE,
-                    depth      INTEGER NOT NULL,
-                    seen       INTEGER NOT NULL DEFAULT 1,
-                    status     TEXT    NOT NULL DEFAULT 'NEW',
-                    claimed_by TEXT,
-                    found_at   TEXT DEFAULT CURRENT_TIMESTAMP,
-                    visited_at TEXT,
-                    error      TEXT
-                )""",
-                "CREATE INDEX idx_links_status_depth ON links (status, depth)",
+                SCHEMA_V1_TABLE,
+                SCHEMA_V1_INDEX,
                 """
                 INSERT INTO links (url, depth, seen, status, claimed_by)
                 VALUES ('https://example.com/', 0, 3, 'VISITED', 'crawler-1')""",
@@ -172,7 +179,43 @@ class DBConnTest {
             assertEquals(3, row.seen());
             assertEquals("crawler-1", row.claimedBy());
             // Po migracji robot może dalej pracować na tych danych.
-            assertEquals("https://example.com/new", old.claimNextLink("w", 1).orElseThrow().url());
+            assertEquals("https://example.com/new", old.claimNextLink("w", 1, NOW).orElseThrow().url());
+        }
+    }
+
+    @Test
+    void databaseInVersionOneGetsRetryColumnsAndKeepsData() throws SQLException {
+        // Baza z wersji programu, w której ostatnią migracją była 1 - bez kolumn do ponawiania.
+        Path file = tempDir.resolve("v1.db");
+        executeRaw(file,
+                SCHEMA_V1_TABLE,
+                SCHEMA_V1_INDEX,
+                """
+                INSERT INTO links (url, depth, seen, status, claimed_by, visited_at, error)
+                VALUES ('https://example.com/', 0, 3, 'ERROR', 'crawler-1', '2026-11-01 10:00:00', 'HTTP 503')""",
+                "INSERT INTO links (url, depth) VALUES ('https://example.com/new', 1)",
+                "PRAGMA user_version = 1");
+
+        try (DBConn old = new DBConn(file.toString())) {
+            old.connect();
+            assertEquals(1, old.schemaVersion());
+
+            old.createTables();
+
+            assertEquals(DBConn.LATEST_SCHEMA_VERSION, old.schemaVersion());
+            assertEquals(Map.of("ERROR", 1, "NEW", 1), old.countByStatus());
+            DBConn.LinkRow row = old.findByUrl("https://example.com/").orElseThrow();
+            assertEquals(3, row.seen());
+            assertEquals("crawler-1", row.claimedBy());
+            assertEquals("2026-11-01 10:00:00", row.visitedAt());
+            assertEquals("HTTP 503", row.error());
+            // Istniejące wiersze: zero prób i brak terminu ponowienia - jak nowy link.
+            assertEquals(0, row.attempts());
+            assertNull(row.retryAt());
+            // Link NEW sprzed migracji da się od razu przejąć (retry_at = NULL).
+            LinkRecord claimed = old.claimNextLink("w", 1, NOW).orElseThrow();
+            assertEquals("https://example.com/new", claimed.url());
+            assertEquals(0, claimed.attempts());
         }
     }
 
@@ -225,7 +268,7 @@ class DBConnTest {
         db.insertRow(URL + "a", 0);
         db.insertRow(URL + "b", 0);
 
-        LinkRecord claimed = db.claimNextLink("worker-1", 5).orElseThrow();
+        LinkRecord claimed = db.claimNextLink("worker-1", 5, NOW).orElseThrow();
 
         assertEquals(URL + "a", claimed.url());
         assertEquals(0, claimed.depth());
@@ -243,8 +286,8 @@ class DBConnTest {
         assertTrue(db.findByUrl(URL + "deep").orElseThrow().id()
                 < db.findByUrl(URL + "shallow").orElseThrow().id());
 
-        assertEquals(URL + "shallow", db.claimNextLink("w", 5).orElseThrow().url());
-        assertEquals(URL + "deep", db.claimNextLink("w", 5).orElseThrow().url());
+        assertEquals(URL + "shallow", db.claimNextLink("w", 5, NOW).orElseThrow().url());
+        assertEquals(URL + "deep", db.claimNextLink("w", 5, NOW).orElseThrow().url());
     }
 
     @Test
@@ -255,11 +298,11 @@ class DBConnTest {
         // więc wyprzedza "older", choć wcześniej był za nim (większe depth i id).
         db.insertRow(URL + "later", 1);
 
-        LinkRecord first = db.claimNextLink("w", 5).orElseThrow();
+        LinkRecord first = db.claimNextLink("w", 5, NOW).orElseThrow();
 
         assertEquals(URL + "later", first.url());
         assertEquals(1, first.depth(), "wątek dostaje aktualną, zmniejszoną głębokość");
-        assertEquals(URL + "older", db.claimNextLink("w", 5).orElseThrow().url());
+        assertEquals(URL + "older", db.claimNextLink("w", 5, NOW).orElseThrow().url());
     }
 
     @Test
@@ -267,11 +310,11 @@ class DBConnTest {
         db.insertRow(URL + "a", 0);
         db.insertRow(URL + "b", 0);
 
-        LinkRecord first = db.claimNextLink("worker-1", 5).orElseThrow();
-        LinkRecord second = db.claimNextLink("worker-2", 5).orElseThrow();
+        LinkRecord first = db.claimNextLink("worker-1", 5, NOW).orElseThrow();
+        LinkRecord second = db.claimNextLink("worker-2", 5, NOW).orElseThrow();
 
         assertNotEquals(first.id(), second.id());
-        assertTrue(db.claimNextLink("worker-3", 5).isEmpty());
+        assertTrue(db.claimNextLink("worker-3", 5, NOW).isEmpty());
     }
 
     @Test
@@ -279,14 +322,14 @@ class DBConnTest {
         db.insertRow(URL + "deep", 3);
         db.insertRow(URL + "shallow", 2);
 
-        assertEquals(URL + "shallow", db.claimNextLink("w", 2).orElseThrow().url());
-        assertTrue(db.claimNextLink("w", 2).isEmpty());
+        assertEquals(URL + "shallow", db.claimNextLink("w", 2, NOW).orElseThrow().url());
+        assertTrue(db.claimNextLink("w", 2, NOW).isEmpty());
         assertEquals("NEW", db.findByUrl(URL + "deep").orElseThrow().status());
     }
 
     @Test
     void claimOnEmptyTableGivesEmptyResult() {
-        assertTrue(db.claimNextLink("w", 10).isEmpty());
+        assertTrue(db.claimNextLink("w", 10, NOW).isEmpty());
     }
 
     @Test
@@ -296,7 +339,7 @@ class DBConnTest {
             db.insertRow(URL + i, 0);
         }
         int claimed = 0;
-        while (db.claimNextLink("w", 0).isPresent()) {
+        while (db.claimNextLink("w", 0, NOW).isPresent()) {
             claimed++;
         }
         assertEquals(45, claimed);
@@ -445,7 +488,7 @@ class DBConnTest {
         DBConn.LinkRow row = db.findByUrl(URL).orElseThrow();
         assertEquals("NEW", row.status());
         assertNull(row.claimedBy());
-        assertEquals(link.id(), db.claimNextLink("other", 0).orElseThrow().id());
+        assertEquals(link.id(), db.claimNextLink("other", 0, NOW).orElseThrow().id());
     }
 
     @Test
@@ -456,6 +499,133 @@ class DBConnTest {
         db.releaseLink(link.id());
 
         assertEquals("VISITED", db.findByUrl(URL).orElseThrow().status());
+    }
+
+    // ---- ponawianie ----
+
+    @Test
+    void newLinkHasNoAttemptsAndNoRetryTime() {
+        db.insertRow(URL, 0);
+
+        DBConn.LinkRow row = db.findByUrl(URL).orElseThrow();
+        assertEquals(0, row.attempts());
+        assertNull(row.retryAt());
+    }
+
+    @Test
+    void scheduleRetryReturnsLinkToNewWithAttemptErrorAndTime() {
+        LinkRecord link = insertAndClaim(URL);
+
+        db.scheduleRetry(link.id(), "HTTP 503", NOW + 1_000);
+
+        DBConn.LinkRow row = db.findByUrl(URL).orElseThrow();
+        assertEquals("NEW", row.status());
+        assertNull(row.claimedBy(), "link nie należy już do żadnego wątku");
+        assertEquals(1, row.attempts());
+        assertEquals("HTTP 503", row.error());
+        assertEquals(NOW + 1_000, row.retryAt());
+        assertNull(row.visitedAt(), "to nie jest status końcowy");
+
+        // Kolejna nieudana próba: licznik rośnie, błąd i termin są nadpisywane.
+        LinkRecord retried = db.claimNextLink("w", 0, NOW + 1_000).orElseThrow();
+        db.scheduleRetry(retried.id(), "Przekroczono czas oczekiwania (2000 ms)", NOW + 3_000);
+
+        row = db.findByUrl(URL).orElseThrow();
+        assertEquals(2, row.attempts());
+        assertEquals("Przekroczono czas oczekiwania (2000 ms)", row.error());
+        assertEquals(NOW + 3_000, row.retryAt());
+    }
+
+    @Test
+    void scheduleRetryChangesOnlyLinkInProgress() {
+        LinkRecord visited = insertAndClaim(URL + "visited");
+        db.markVisited(visited.id());
+        db.insertRow(URL + "new", 0);
+        long newId = db.findByUrl(URL + "new").orElseThrow().id();
+
+        db.scheduleRetry(visited.id(), "HTTP 503", NOW + 1_000);
+        db.scheduleRetry(newId, "HTTP 503", NOW + 1_000);
+
+        DBConn.LinkRow visitedRow = db.findByUrl(URL + "visited").orElseThrow();
+        assertEquals("VISITED", visitedRow.status());
+        assertEquals("w", visitedRow.claimedBy());
+        assertEquals(0, visitedRow.attempts());
+        assertNull(visitedRow.retryAt());
+        assertNull(visitedRow.error());
+        DBConn.LinkRow newRow = db.findByUrl(URL + "new").orElseThrow();
+        assertEquals(0, newRow.attempts());
+        assertNull(newRow.retryAt());
+    }
+
+    @Test
+    void linkWaitingForRetryIsClaimedOnlyFromRetryTime() {
+        LinkRecord link = insertAndClaim(URL);
+        db.scheduleRetry(link.id(), "HTTP 503", NOW + 1_000);
+
+        assertTrue(db.claimNextLink("w", 0, NOW).isEmpty());
+        assertTrue(db.claimNextLink("w", 0, NOW + 999).isEmpty(), "milisekundę przed terminem");
+        assertEquals("NEW", db.findByUrl(URL).orElseThrow().status());
+
+        // retry_at <= nowMs: dokładnie w terminie link już wolno przejąć.
+        LinkRecord retried = db.claimNextLink("worker-2", 0, NOW + 1_000).orElseThrow();
+
+        assertEquals(link.id(), retried.id());
+        assertEquals(1, retried.attempts(), "wątek dostaje liczbę wcześniejszych prób");
+        DBConn.LinkRow row = db.findByUrl(URL).orElseThrow();
+        assertEquals("IN_PROGRESS", row.status());
+        assertEquals("worker-2", row.claimedBy());
+    }
+
+    @Test
+    void linksWaitingForRetryDoNotBlockReadyLinks() {
+        // Więcej czekających niż jedna paczka kandydatów (20), wszystkie płytsze niż gotowy link.
+        // Warunek retry_at jest w SQL, więc LIMIT liczy tylko linki, które wolno przejąć.
+        for (int i = 0; i < 25; i++) {
+            LinkRecord waiting = insertAndClaim(URL + "waiting" + i);
+            db.scheduleRetry(waiting.id(), "HTTP 503", NOW + 1_000);
+        }
+        db.insertRow(URL + "ready", 1);
+
+        assertEquals(URL + "ready", db.claimNextLink("w", 1, NOW).orElseThrow().url());
+        assertTrue(db.claimNextLink("w", 1, NOW).isEmpty());
+    }
+
+    @Test
+    void linkWaitingForRetryIsPendingWork() {
+        LinkRecord link = insertAndClaim(URL);
+        db.scheduleRetry(link.id(), "HTTP 503", NOW + 60_000);
+
+        assertTrue(db.claimNextLink("w", 0, NOW).isEmpty(), "termin jeszcze nie minął");
+        assertTrue(db.hasPendingWork(0), "wątki mają czekać na ponowienie, a nie kończyć pracę");
+    }
+
+    @Test
+    void linkWaitingForRetrySurvivesRestart() {
+        LinkRecord waiting = insertAndClaim(URL + "waiting");
+        db.scheduleRetry(waiting.id(), "HTTP 503", NOW + 1_000);
+        // Drugi link przerwany w trakcie pobierania - resetInProgress ma zmienić tylko jego.
+        insertAndClaim(URL + "interrupted");
+        db.disconnect();
+
+        // Następne uruchomienie przygotowuje bazę tak jak Crawler.prepareDatabase.
+        try (DBConn restarted = new DBConn(tempDir.resolve("test.db").toString())) {
+            restarted.connect();
+            restarted.createTables();
+            assertEquals(1, restarted.resetInProgress());
+
+            DBConn.LinkRow row = restarted.findByUrl(URL + "waiting").orElseThrow();
+            assertEquals("NEW", row.status());
+            assertEquals(1, row.attempts());
+            assertEquals(NOW + 1_000, row.retryAt());
+            assertEquals("HTTP 503", row.error());
+
+            // Termin ponowienia nadal obowiązuje: przed nim dostępny jest tylko przerwany link.
+            assertEquals(URL + "interrupted", restarted.claimNextLink("w", 0, NOW).orElseThrow().url());
+            assertTrue(restarted.claimNextLink("w", 0, NOW).isEmpty());
+            LinkRecord retried = restarted.claimNextLink("w", 0, NOW + 1_000).orElseThrow();
+            assertEquals(URL + "waiting", retried.url());
+            assertEquals(1, retried.attempts());
+        }
     }
 
     // ---- stan pracy ----
@@ -483,7 +653,7 @@ class DBConnTest {
     void linkInProgressIsPendingWorkRegardlessOfDepth() {
         // Wątek, który go przetwarza, może jeszcze dopisać nowe linki do bazy.
         db.insertRow(URL, 3);
-        db.claimNextLink("w", 3).orElseThrow();
+        db.claimNextLink("w", 3, NOW).orElseThrow();
 
         assertTrue(db.hasPendingWork(0));
     }
@@ -570,7 +740,7 @@ class DBConnTest {
     /** Wstawia link i przejmuje go jako podany wątek; zwraca id. */
     private long claim(String url, String worker) {
         db.insertRow(url, 0);
-        LinkRecord link = db.claimNextLink(worker, 0).orElseThrow();
+        LinkRecord link = db.claimNextLink(worker, 0, NOW).orElseThrow();
         assertEquals(url, link.url());
         return link.id();
     }
@@ -578,7 +748,7 @@ class DBConnTest {
     /** Wstawia link i od razu go przejmuje (w tabeli nie może być innych linków NEW). */
     private LinkRecord insertAndClaim(String url) {
         db.insertRow(url, 0);
-        LinkRecord link = db.claimNextLink("w", 0).orElseThrow();
+        LinkRecord link = db.claimNextLink("w", 0, NOW).orElseThrow();
         assertEquals(url, link.url());
         return link;
     }

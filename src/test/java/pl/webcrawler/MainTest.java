@@ -70,6 +70,26 @@ class MainTest {
         assertEquals(CrawlerConfig.DEFAULT_USER_AGENT, config.userAgent());
         assertFalse(config.fresh(), "domyślnie wznawiamy poprzednią pracę");
         assertTrue(config.respectRobots(), "domyślnie robots.txt jest respektowany");
+        assertEquals(CrawlerConfig.DEFAULT_MAX_RETRIES, config.maxRetries());
+        assertEquals(2, config.maxRetries(), "domyślnie dwa ponowienia, czyli najwyżej trzy próby");
+    }
+
+    @Test
+    void retriesAcceptsZeroAndLargeValues() {
+        assertEquals(0, Main.parseArgs(new String[] {"https://a.pl", "--retries", "0"}).maxRetries(),
+                "0 = bez ponawiania");
+        assertEquals(5, Main.parseArgs(new String[] {"--retries", "5", "https://a.pl"}).maxRetries());
+        // Przerwa i tak nie przekroczy 30 s - retryDelayMs ogranicza wykładnik.
+        assertEquals(Integer.MAX_VALUE, Main.parseArgs(
+                new String[] {"https://a.pl", "--retries", String.valueOf(Integer.MAX_VALUE)}).maxRetries());
+    }
+
+    @Test
+    void negativeRetriesAreRejectedAlsoByConfig() {
+        // Ta sama granica w CrawlerConfig - na wypadek tworzenia konfiguracji z pominięciem Main.
+        IllegalArgumentException e = assertThrows(IllegalArgumentException.class,
+                () -> new CrawlerConfig("https://a.pl", 1, 1, 0, true, "x.db", false, 1_000, 0, "agent", true, -1));
+        assertTrue(e.getMessage().contains("maxRetries musi być >= 0"), e.getMessage());
     }
 
     @Test
@@ -77,7 +97,7 @@ class MainTest {
         CrawlerConfig config = Main.parseArgs(new String[] {
                 "--threads", "8", "--all-hosts", "https://example.com/start",
                 "--max-pages", "50", "--max-depth", "0", "--db", "out.db",
-                "--fresh", "--delay", "0", "--timeout", "2500", "--ignore-robots",
+                "--fresh", "--delay", "0", "--timeout", "2500", "--ignore-robots", "--retries", "4",
                 // Jeden argument ze spacjami - tak przekaże go powłoka dla wartości w cudzysłowie.
                 "--user-agent", "MojRobot/2.0 (+https://example.com/bot)"});
 
@@ -92,11 +112,12 @@ class MainTest {
         assertEquals(2500, config.timeoutMs());
         assertEquals("MojRobot/2.0 (+https://example.com/bot)", config.userAgent());
         assertFalse(config.respectRobots());
+        assertEquals(4, config.maxRetries());
     }
 
     private static CrawlerConfig configWith(int timeoutMs, int delayMs, boolean respectRobots) {
         return new CrawlerConfig("https://a.pl", 1, 1, 0, true, "x.db", false, timeoutMs, delayMs,
-                "test-agent", respectRobots);
+                "test-agent", respectRobots, CrawlerConfig.DEFAULT_MAX_RETRIES);
     }
 
     @Test
@@ -175,6 +196,8 @@ class MainTest {
         assertTrue(usage.contains("--user-agent"), usage);
         assertTrue(usage.contains("--version"), usage);
         assertTrue(usage.contains("--ignore-robots"), usage);
+        assertTrue(usage.contains("--retries N"), usage);
+        assertTrue(usage.contains("(domyślnie " + CrawlerConfig.DEFAULT_MAX_RETRIES + ","), usage);
         assertTrue(usage.contains(CrawlerConfig.DEFAULT_USER_AGENT), usage);
         assertTrue(usage.contains("Wznawianie"), usage);
         assertTrue(usage.contains("java -jar"), usage);
@@ -218,6 +241,12 @@ class MainTest {
             https://a.pl --user-agent                      | Brak wartości po --user-agent
             https://a.pl --user-agent --fresh              | Brak wartości po --user-agent
             https://a.pl --user-agent A --user-agent B     | Opcja --user-agent podana więcej niż raz
+            https://a.pl --retries                         | Brak wartości po --retries
+            https://a.pl --retries --fresh                 | Brak wartości po --retries
+            https://a.pl --retries -1                      | --retries: wartość musi być >= 0, podano: -1
+            https://a.pl --retries dwa                     | --retries: oczekiwano liczby całkowitej, podano: dwa
+            https://a.pl --retries 1.5                     | --retries: oczekiwano liczby całkowitej, podano: 1.5
+            https://a.pl --retries 1 --retries 2           | Opcja --retries podana więcej niż raz
             ftp://example.com                              | Niepoprawny adres startowy
             """)
     void invalidArgumentsGiveReadableMessage(String argsLine, String expectedFragment) {
@@ -232,8 +261,8 @@ class MainTest {
     @Test
     void reportShowsAllSections() {
         List<DBConn.LinkRow> mostSeen = List.of(
-                new DBConn.LinkRow(2, "https://a.pl/popular", 1, 7, "VISITED", "crawler-1", null, null),
-                new DBConn.LinkRow(1, "https://a.pl/", 0, 2, "VISITED", "crawler-2", null, null));
+                new DBConn.LinkRow(2, "https://a.pl/popular", 1, 7, "VISITED", "crawler-1", null, null, 0, null),
+                new DBConn.LinkRow(1, "https://a.pl/", 0, 2, "VISITED", "crawler-2", null, null, 0, null));
         Map<String, Integer> byWorker = new LinkedHashMap<>();
         byWorker.put("crawler-2", 4);
         byWorker.put("crawler-10", 1);
