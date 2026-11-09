@@ -8,6 +8,15 @@ zmiany jeszcze niewydane są w sekcji „Niewydane”.
 
 ### Dodane
 
+- Graf linków: migracja schematu 3 dodaje tabelę `edges` i indeks na `to_id`. Krawędzie, ich liczniki
+  wystąpień (także duplikaty i linki strony do samej siebie) oraz status `VISITED` są zapisywane w tej
+  samej transakcji co znalezione linki. Krawędzie powstają tylko dla stron odwiedzonych po migracji.
+- Opcja `--export KATALOG` (tylko z `--db`, bez adresu startowego): strumieniowy eksport wszystkich kolumn
+  `links` do `links.csv`, krawędzi do `edges.csv` (`from_url,to_url,count`) oraz grafu stron `VISITED`
+  do `graph.dot`. UTF-8, CSV według RFC 4180 z nagłówkami, escapowanie etykiet DOT. Katalog jest tworzony,
+  pliki nadpisywane; program wypisuje ścieżki i liczby wierszy. Brak bazy daje błąd bez tworzenia pliku.
+- Raport po crawlu: 10 stron, do których linkuje najwięcej różnych stron (na podstawie `edges`,
+  duplikaty na jednej stronie nie zwiększają liczby źródeł).
 - Obsługa `robots.txt` (uproszczona wersja RFC 9309): plik każdego hosta jest pobierany najwyżej raz
   na uruchomienie (`RobotsCache`), wybierana jest grupa dla tokenu produktu z `User-Agent` albo grupa `*`,
   a o dostępie decyduje najdłuższa pasująca reguła `Allow`/`Disallow` (przy remisie `Allow`; obsługa `*` i `$`).

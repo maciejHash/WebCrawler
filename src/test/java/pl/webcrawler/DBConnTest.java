@@ -10,11 +10,13 @@ import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import java.nio.file.Path;
+import java.nio.file.Files;
 import java.sql.Connection;
 import java.sql.DriverManager;
 import java.sql.SQLException;
 import java.sql.Statement;
 import java.util.Arrays;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 
@@ -220,6 +222,64 @@ class DBConnTest {
     }
 
     @Test
+    void databaseInVersionTwoGetsEdgesWithoutInventingHistoricalEdges() throws SQLException {
+        Path file = tempDir.resolve("v2.db");
+        executeRaw(file, SCHEMA_V1_TABLE, SCHEMA_V1_INDEX,
+                "ALTER TABLE links ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0",
+                "ALTER TABLE links ADD COLUMN retry_at INTEGER",
+                """
+                INSERT INTO links (id, url, depth, seen, status, found_at, visited_at, attempts, retry_at, error)
+                VALUES (7, 'https://example.com/', 0, 5, 'VISITED', '2026-11-01 09:00:00',
+                        '2026-11-01 10:00:00', 2, 1234, 'stary opis')""",
+                "INSERT INTO links (url, depth) VALUES ('https://example.com/new', 1)",
+                "PRAGMA user_version = 2");
+        try (DBConn old = new DBConn(file.toString())) {
+            old.connect();
+            old.createTables();
+            old.createTables();
+            assertEquals(3, old.schemaVersion());
+            DBConn.LinkRow row = old.findByUrl(URL).orElseThrow();
+            assertEquals(7, row.id());
+            assertEquals(5, row.seen());
+            assertEquals("VISITED", row.status());
+            assertEquals("2026-11-01 09:00:00", row.foundAt());
+            assertEquals("2026-11-01 10:00:00", row.visitedAt());
+            assertEquals(2, row.attempts());
+            assertEquals(1234L, row.retryAt());
+            assertEquals("stary opis", row.error());
+            assertEquals(0, old.forEachEdge(false, edge -> {}));
+            LinkRecord page = old.claimNextLink("w", 1, NOW).orElseThrow();
+            old.saveVisitedPage(page.id(), List.of(URL), 2);
+            List<DBConn.EdgeRow> edges = new ArrayList<>();
+            old.forEachEdge(false, edges::add);
+            assertEquals(List.of(new DBConn.EdgeRow(page.id(), 7, URL + "new", URL, 1)), edges);
+        }
+        try (Connection conn = DriverManager.getConnection("jdbc:sqlite:" + file);
+             Statement stmt = conn.createStatement()) {
+            try (var rs = stmt.executeQuery("SELECT sql FROM sqlite_master WHERE name = 'edges'")) {
+                assertTrue(rs.next());
+                assertTrue(rs.getString(1).contains("WITHOUT ROWID"));
+            }
+            try (var rs = stmt.executeQuery("PRAGMA index_info(idx_edges_to_id)")) {
+                assertTrue(rs.next());
+                assertEquals("to_id", rs.getString("name"));
+            }
+            stmt.execute("PRAGMA foreign_keys = ON");
+            assertThrows(SQLException.class,
+                    () -> stmt.execute("INSERT INTO edges (from_id, to_id) VALUES (999, 7)"));
+        }
+    }
+
+    @Test
+    void connectingToMissingExistingDatabaseNeverCreatesFile() {
+        Path missing = tempDir.resolve("missing.db");
+        try (DBConn other = new DBConn(missing.toString())) {
+            assertThrows(DatabaseException.class, other::connectExisting);
+        }
+        assertFalse(Files.exists(missing));
+    }
+
+    @Test
     void createTablesTwiceKeepsDataAndVersion() {
         db.insertRow(URL, 0);
 
@@ -249,16 +309,19 @@ class DBConnTest {
     @Test
     void dropTablesRemovesTableAndResetsVersion() {
         db.insertRow(URL, 0);
+        db.saveVisitedPage(db.findByUrl(URL).orElseThrow().id(), List.of(URL), 1);
 
         db.dropTables();
 
         assertEquals(0, db.schemaVersion());
         // Brak tabeli → SQLite zgłasza błąd, który DBConn opakowuje w DatabaseException.
         assertThrows(DatabaseException.class, () -> db.findByUrl(URL));
+        assertThrows(DatabaseException.class, () -> db.forEachEdge(false, edge -> {}));
         // Wersja 0, więc createTables() wykonuje migracje od nowa - tabela jest pusta.
         db.createTables();
         assertEquals(DBConn.LATEST_SCHEMA_VERSION, db.schemaVersion());
         assertTrue(db.findByUrl(URL).isEmpty());
+        assertEquals(0, db.forEachEdge(false, edge -> {}));
     }
 
     // ---- przejmowanie linków ----
@@ -395,6 +458,54 @@ class DBConnTest {
         DBConn.LinkRow known = db.findByUrl(URL + "known").orElseThrow();
         assertEquals(2, known.seen());
         assertEquals(1, known.depth(), "depth = MIN(3, 1)");
+    }
+
+    @Test
+    void saveVisitedPageStoresDirectedEdgesCountsAndSelfLinks() {
+        LinkRecord page = insertAndClaim(URL);
+        db.saveVisitedPage(page.id(), List.of(URL, URL + "a", URL + "a"), 1);
+        long other = db.findByUrl(URL + "a").orElseThrow().id();
+        db.saveVisitedPage(other, List.of(URL), 2);
+        List<DBConn.EdgeRow> edges = new ArrayList<>();
+        assertEquals(3, db.forEachEdge(false, edges::add));
+        assertEquals(List.of(
+                new DBConn.EdgeRow(page.id(), page.id(), URL, URL, 1),
+                new DBConn.EdgeRow(page.id(), other, URL, URL + "a", 2),
+                new DBConn.EdgeRow(other, page.id(), URL + "a", URL, 1)), edges);
+    }
+
+    @Test
+    void edgeFailureRollsBackLinksCountsEdgesAndPageStatus() throws SQLException {
+        LinkRecord page = insertAndClaim(URL);
+        db.saveVisitedPage(page.id(), List.of(URL + "known"), 1);
+        db.releaseLink(db.claimNextLink("w", 1, NOW).orElseThrow().id());
+        long source = db.findByUrl(URL + "known").orElseThrow().id();
+        // Pierwsza krawędź przejdzie, druga wywoła błąd już po UPSERT-ach wszystkich linków.
+        executeRaw(tempDir.resolve("test.db"), """
+                CREATE TRIGGER fail_edge BEFORE INSERT ON edges
+                WHEN NEW.to_id = (SELECT id FROM links WHERE url = 'https://example.com/fail')
+                BEGIN SELECT RAISE(ABORT, 'test krawędzi'); END""");
+        db.claimNextLink("w", 1, NOW).orElseThrow();
+        assertThrows(DatabaseException.class,
+                () -> db.saveVisitedPage(source, List.of(URL, URL + "fail"), 2));
+        assertTrue(db.findByUrl(URL + "fail").isEmpty());
+        assertEquals(1, db.findByUrl(URL).orElseThrow().seen());
+        assertEquals("IN_PROGRESS", db.findByUrl(URL + "known").orElseThrow().status());
+        List<DBConn.EdgeRow> edges = new ArrayList<>();
+        db.forEachEdge(false, edges::add);
+        assertEquals(List.of(new DBConn.EdgeRow(page.id(), source, URL, URL + "known", 1)), edges);
+    }
+
+    @Test
+    void mostLinkedCountsSourcesRatherThanOccurrencesAndRespectsLimitAndTies() {
+        db.addSeed(URL);
+        long a = db.findByUrl(URL).orElseThrow().id();
+        db.saveVisitedPage(a, List.of(URL + "b", URL + "b", URL + "b", URL + "c", URL + "d"), 1);
+        long b = db.findByUrl(URL + "b").orElseThrow().id();
+        db.saveVisitedPage(b, List.of(URL + "c"), 2);
+        assertEquals(List.of(new DBConn.IncomingLinks(URL + "c", 2),
+                new DBConn.IncomingLinks(URL + "b", 1)), db.findMostLinked(2));
+        assertTrue(db.findMostLinked(0).isEmpty());
     }
 
     @Test

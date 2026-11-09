@@ -10,7 +10,8 @@ Wielowątkowy robot internetowy w Javie, który przegląda strony WWW i zapisuje
 - żadna strona nie jest pobierana dwa razy - pilnuje tego baza danych,
 - przerwaną pracę można wznowić, bo cały stan jest w pliku bazy,
 - respektuje `robots.txt` (w tym `Crawl-delay`) i meta tag `robots` z `nofollow`,
-- ponawia strony z błędem przejściowym (timeout, odrzucone połączenie, HTTP 429 i 5xx).
+- ponawia strony z błędem przejściowym (timeout, odrzucone połączenie, HTTP 429 i 5xx),
+- zapisuje graf linków i eksportuje wyniki do CSV oraz DOT (Graphviz).
 
 ## Wymagania
 
@@ -46,7 +47,7 @@ mvn -q compile exec:java -Dexec.args="https://books.toscrape.com --max-pages 20"
 
 | Opcja | Domyślnie | Znaczenie |
 |---|---|---|
-| `<startUrl>` | – (wymagany) | Adres strony startowej, `http` lub `https`. Jest normalizowany tak samo jak każdy inny link. |
+| `<startUrl>` | – (wymagany przy crawlu) | Adres strony startowej, `http` lub `https`. Jest normalizowany tak samo jak każdy inny link. W trybie `--export` niedozwolony. |
 | `--threads N` | `4` | Liczba wątków w puli (`N >= 1`). |
 | `--max-pages N` | `100` | Wspólny dla wszystkich wątków limit stron pobranych **w tym uruchomieniu** (`N >= 1`). |
 | `--max-depth N` | `3` | Maksymalna głębokość; strona startowa ma 0, linki z niej 1 itd. (`N >= 0`). |
@@ -57,11 +58,36 @@ mvn -q compile exec:java -Dexec.args="https://books.toscrape.com --max-pages 20"
 | `--all-hosts` | wyłączone | Odwiedzaj też strony z innych hostów. Domyślnie tylko host startowy (`www.` i wielkość liter są pomijane). Linki do innych hostów i tak trafiają do bazy, a po przejęciu przez wątek dostają status `SKIPPED`. |
 | `--ignore-robots` | wyłączone | Nie pobiera `robots.txt` i odwiedza także strony, których zabrania; `Crawl-delay` też nie obowiązuje. Meta tag `robots` z `nofollow` jest respektowany zawsze. Patrz [robots.txt](#robotstxt). |
 | `--db plik` | `crawler.db` | Plik bazy SQLite. |
+| `--export KATALOG` | wyłączone | Eksportuje `links.csv`, `edges.csv` i `graph.dot`, bez crawlowania i adresu startowego. Można łączyć tylko z `--db`. Baza musi istnieć; katalog jest tworzony, pliki nadpisywane. |
 | `--fresh` | wyłączone | Usuwa dane z bazy i zaczyna od nowa. Bez tej flagi robot wznawia pracę zapisaną w bazie. |
 | `-h`, `--help` | | Wyświetla pomoc (działa nawet przy błędnych pozostałych argumentach). |
 | `--version` | | Wypisuje `Web Crawler <wersja>` i kończy program kodem 0 (też przy błędnych pozostałych argumentach). |
 
-Każda opcja może wystąpić najwyżej raz. Błędne argumenty kończą program kodem 2, błąd bazy kodem 1.
+Każda opcja może wystąpić najwyżej raz. Błędne argumenty kończą program kodem 2, błąd bazy lub zapisu
+eksportu kodem 1. Pomoc i wersja zachowują pierwszeństwo przed walidacją argumentów także przy `--export`.
+
+### Eksport wyników
+
+```bash
+java -jar target/web-crawler.jar --export wyniki --db crawler.db
+cd wyniki
+dot -Tsvg graph.dot -o graph.svg
+```
+
+Eksport nie wykonuje żądań HTTP i nie potrzebuje `startUrl`. Brak pliku bazy kończy się czytelnym błędem,
+bez tworzenia pustej bazy. Istniejąca baza przechodzi brakujące migracje schematu, ale statusy stron
+i liczniki nie są zmieniane. Program wypisuje pełne ścieżki oraz liczby wierszy danych (bez nagłówka),
+a dla DOT liczbę węzłów i krawędzi.
+
+- `links.csv` zawiera wszystkie kolumny i wszystkie wiersze `links`, w kolejności `id`.
+- `edges.csv` zawiera `from_url,to_url,count` dla wszystkich krawędzi, także do stron nieodwiedzonych.
+- `graph.dot` zawiera wyłącznie węzły `VISITED` (także bez krawędzi) i krawędzie pomiędzy nimi.
+  Etykiety węzłów to adresy, etykiety krawędzi to `count`. Cudzysłów i `\` w etykietach są escapowane.
+  Do wygenerowania SVG potrzebny jest osobno zainstalowany Graphviz.
+
+Pliki są w UTF-8. CSV ma nagłówki i końce rekordów CRLF zgodnie z RFC 4180: pola zawierające przecinek,
+cudzysłów, CR lub LF są w cudzysłowach, a wewnętrzny cudzysłów jest podwajany. `NULL` daje puste pole.
+`DBConn` przekazuje wiersze pojedynczo do `Exporter`, więc eksport nie ładuje całej bazy do pamięci.
 
 ### Wznawianie i Ctrl+C
 
@@ -77,7 +103,10 @@ Każda opcja może wystąpić najwyżej raz. Błędne argumenty kończą program
 ### Raport
 
 Na końcu program wypisuje raport: liczbę linków w każdym statusie, 10 najczęściej
-znajdowanych linków, liczbę stron pobranych przez każdy wątek i czas trwania.
+znajdowanych linków (`seen`), 10 stron, do których linkuje najwięcej różnych stron (`edges`),
+liczbę stron pobranych przez każdy wątek i czas trwania. Ranking z `edges` obejmuje całą bazę,
+także nieodwiedzone cele. Duplikaty na jednej stronie zwiększają `count`, ale nie liczbę źródeł;
+link strony do samej siebie też liczy się jako źródło. Przy remisie decyduje `id` celu.
 
 ## Ponawianie błędów przejściowych
 
@@ -211,13 +240,14 @@ Wszystkie klasy są w pakiecie `pl.webcrawler`.
 
 | Klasa | Odpowiedzialność |
 |---|---|
-| `Main` | Parsowanie argumentów, uruchomienie `Crawler`, shutdown hook dla Ctrl+C, wypisanie raportu. |
+| `Main` | Parsowanie argumentów, uruchomienie `Crawler` albo eksportu, shutdown hook dla Ctrl+C, wypisanie raportu. |
 | `CrawlerConfig` | Record z ustawieniami uruchomienia; sprawdza wartości i normalizuje adres startowy. |
 | `Crawler` | Przygotowuje bazę, tworzy pulę wątków (`Executors.newFixedThreadPool`), czeka na koniec, zbiera statystyki. |
 | `CrawlerThread` | `Runnable` - pętla: przejmij link → sprawdź `robots.txt` → pobierz stronę → wyciągnij linki → zapisz je → oznacz stronę (albo zaplanuj ponowienie po błędzie przejściowym). |
 | `RobotsTxt` | Reguły z `robots.txt` dla naszego robota: wybór grupy, `Allow`/`Disallow` (najdłuższe dopasowanie, `*`, `$`), `Crawl-delay`. Sama logika, bez sieci. |
 | `RobotsCache` | Pobiera `robots.txt` każdego hosta najwyżej raz na uruchomienie; jedna instancja wspólna dla wątków. |
 | `DBConn` | Cały SQL; jedna instancja współdzielona przez wątki, metody publiczne `synchronized`. |
+| `Exporter` | Strumieniowy zapis CSV (RFC 4180) i grafu DOT, bez SQL i bez listy całej bazy w pamięci. |
 | `LinkRecord` | Record `(id, url, depth, attempts)` - link przejęty przez wątek. |
 | `AppVersion` | Wersja programu wczytana z `webcrawler-version.properties` (wartość zapasowa `dev`). |
 | `UrlUtils` | Normalizacja adresów, porównywanie hostów, rozpoznawanie plików binarnych. |
@@ -269,6 +299,26 @@ ALTER TABLE links ADD COLUMN retry_at INTEGER;
 Indeks na `(status, depth)` przyspiesza najczęstsze zapytanie: „daj linki `NEW` o głębokości do `maxDepth`,
 od najpłytszych” - i od razu podaje je w tej kolejności (patrz [punkt 2](#2-przejęcie-linku-warunkowym-update)).
 
+### Tabela `edges`
+
+```sql
+-- migracja 3
+CREATE TABLE edges (
+    from_id INTEGER NOT NULL REFERENCES links(id),
+    to_id   INTEGER NOT NULL REFERENCES links(id),
+    count   INTEGER NOT NULL DEFAULT 1,
+    PRIMARY KEY (from_id, to_id)
+) WITHOUT ROWID;
+CREATE INDEX idx_edges_to_id ON edges (to_id);
+```
+
+Jedna para `(from_id, to_id)` to krawędź skierowana ze strony źródłowej do znalezionego adresu.
+`count` to liczba wystąpień odnośnika na stronie, także dla linku do niej samej. Klucz złożony zapewnia
+unikalność pary i nie potrzebuje dodatkowego `rowid`; indeks na `to_id` ułatwia raport źródeł linkujących.
+
+`saveVisitedPage` zapisuje w jednej transakcji najpierw UPSERT-y `links`, następnie krawędzie,
+a na końcu status `VISITED`. Powtórzone wystąpienie pary zwiększa `count` o 1.
+
 ### Statusy
 
 ```mermaid
@@ -304,6 +354,7 @@ Numer wersji schematu jest zapisany w samym pliku bazy (`PRAGMA user_version`; n
 | 0 | Pusty plik albo baza z wersji programu sprzed wersjonowania. |
 | 1 | Tabela `links` i indeks `idx_links_status_depth`. |
 | 2 | Kolumny `attempts` (`INTEGER NOT NULL DEFAULT 0`) i `retry_at` (`INTEGER`, `NULL`) do ponawiania błędów przejściowych. Istniejące wiersze dostają 0 prób i brak terminu. |
+| 3 | Tabela `edges` (`WITHOUT ROWID`, klucz `(from_id, to_id)`) i indeks na `to_id`. Krawędzie tylko dla stron odwiedzonych po migracji; wcześniejsze dane `links` pozostają bez zmian. |
 
 `createTables()` odczytuje `user_version` i wykonuje po kolei brakujące migracje. Każda migracja razem
 z ustawieniem nowego `user_version` to osobna transakcja, więc przerwanie programu nie zostawi migracji
@@ -311,9 +362,13 @@ wykonanej w połowie. Baza z wersją wyższą niż znana programowi (utworzona p
 się błędem `DatabaseException` - starszy program nie zna jej tabel i kolumn, więc jej nie zmienia.
 
 Migracja 1 używa `IF NOT EXISTS`: na bazie ze starszej wersji programu (tabela jest, `user_version = 0`)
-tylko ustawia wersję 1, a dane zostają. `dropTables()` (`--fresh`) usuwa tabelę i zeruje `user_version`
+tylko ustawia wersję 1, a dane zostają. `dropTables()` (`--fresh`) usuwa najpierw `edges`, potem `links` i zeruje `user_version`
 w jednej transakcji. Zmianę schematu dodaje się jako nową migrację na końcu listy - istniejących się
 nie zmienia, bo bazy, które już je mają, nie wykonają ich drugi raz.
+
+Migracja 3 nie odtwarza historycznych krawędzi: wcześniejszy `seen` nie zawiera informacji o stronach
+źródłowych. Przy wznowieniu strony już `VISITED` nie są pobierane ponownie, więc pełny graf od początku
+wymaga nowego crawlu z `--fresh`.
 
 ### Przydatne zapytania
 
@@ -548,12 +603,13 @@ lokalny `com.sun.net.httpserver.HttpServer` z JDK.
 | `RobotsTxtTest` | Parsowanie `robots.txt` (testy parametryzowane): wybór grupy, najdłuższe dopasowanie i remis, `*` i `$`, pusty `Disallow`, `Crawl-delay`, śmieci w pliku (BOM, CRLF, komentarze, nieznane dyrektywy, linie bez dwukropka). |
 | `RobotsCacheTest` | Pobieranie `robots.txt` z lokalnego serwera: 200, 4xx, 5xx, timeout, błąd sieci, przerwanie wątku; przy 8 wątkach naraz plik pobrany raz, osobno dla każdego portu (licznik żądań). |
 | `CrawlerThreadTest` | `extractLinks` na HTML z pamięci, meta tag `robots` (`nofollow`, `none`), przerwa po żądaniu (`--delay` i ograniczony `Crawl-delay`), które błędy są przejściowe (`isTransient`) i przerwy przed ponowieniem (`retryDelayMs`, także dla bardzo dużej liczby prób). |
-| `DBConnTest` | Każda metoda `DBConn` na pliku SQLite w katalogu tymczasowym, w tym kolejność przejmowania (najpłytsze linki pierwsze, także po zmniejszeniu `depth`), `markSkipped` z powodem, `scheduleRetry` i przejmowanie z `retry_at` (termin co do milisekundy, czekające linki nie blokują kolejki, przetrwanie restartu) oraz migracje schematu (nowa baza, baza sprzed wersjonowania, baza w wersji 1 z danymi, baza z nowszej wersji, `dropTables`). |
+| `DBConnTest` | Każda metoda `DBConn` na pliku SQLite w katalogu tymczasowym; BFS, statusy, ponawianie, migracje (w tym z wersji 2 z danymi), `dropTables` obu tabel, krawędzie skierowane, duplikaty i samopętle, wycofanie transakcji po błędzie krawędzi, ranking różnych źródeł, otwarcie istniejącej bazy bez tworzenia pliku. |
+| `ExporterTest` | Eksport w `@TempDir`: wszystkie kolumny i nagłówki CSV, UTF-8, cytowanie przecinka, cudzysłowu, CR i LF, puste pola, nadpisywanie; dokładna treść DOT, escapowanie etykiet, tylko węzły `VISITED` i krawędzie między nimi, także samopętla i izolowany węzeł. |
 | `DBConnConcurrencyTest` | 8 wątków przejmuje 200 linków - każdy link trafia do dokładnie jednego wątku (wspólne i osobne połączenia, test powtarzany). |
 | `CrawlerThreadRunTest` | Cała pętla `run()` na lokalnej stronie: statusy, `seen`, limit stron, zatrzymanie, `Crawl-delay` jako przerwa, przerwanie w trakcie pobierania `robots.txt` (link wraca do `NEW`). Ponawianie ze sterowanym zegarem: 503 dwa razy, potem 200 → `VISITED` po 3 żądaniach; 404 → `ERROR` po 1 żądaniu; `--retries 0`; ciągłe 503 → `ERROR` z liczbą prób; ponowienia wliczane do `--max-pages`; wątek czeka na termin ponowienia, zamiast kończyć. |
-| `CrawlerTest`, `CrawlerEndToEndTest` | Cały robot z pulą wątków: każda strona pobrana dokładnie raz (licznik żądań po stronie serwera), cykle, duplikaty, 404, wznowienie; `robots.txt` pobrany raz, strona zabroniona → `SKIPPED` z `error = 'robots.txt'` bez żądania, `--ignore-robots`, strona z meta `nofollow`. |
+| `CrawlerTest`, `CrawlerEndToEndTest` | Cały robot z pulą wątków: każda strona pobrana dokładnie raz (licznik żądań po stronie serwera), cykle, duplikaty, 404, wznowienie; `robots.txt` pobrany raz, strona zabroniona → `SKIPPED` z `error = 'robots.txt'` bez żądania, `--ignore-robots`, strona z meta `nofollow`; wszystkie krawędzie i `count` zgodne z lokalnym HTML, bez podwajania przy wznowieniu. |
 | `CrawlerFailureTest` | Wyjątki w wątkach (podklasa `DBConn` rzucająca z `saveVisitedPage`): nieoczekiwany błąd strony daje `ERROR` i nie zawiesza robota, `DatabaseException` wychodzi z `Crawler.run()`, a link wraca do `NEW`. |
-| `MainTest` | Parsowanie argumentów (w tym granice `--timeout` i `--retries`, znaki w `--user-agent` i `--ignore-robots`), pomoc, `--version`, wersja w komunikacie startowym i domyślnym User-Agent, czas czekania po Ctrl+C, tekst raportu. |
+| `MainTest` | Parsowanie argumentów (w tym granice `--timeout` i `--retries`, znaki w `--user-agent` i `--ignore-robots`), pomoc, `--version`, wersja w komunikacie startowym i domyślnym User-Agent, czas czekania po Ctrl+C, tekst raportu; `--export` bez URL, konflikty opcji (kod 2), tworzenie plików i liczby wierszy, brak pliku bazy (kod 1, bez tworzenia pliku). |
 | `AppVersionTest` | Wersja z przefiltrowanego zasobu; `dev`, gdy pliku brak albo nie był filtrowany. |
 
 GitHub Actions (`.github/workflows/ci.yml`) uruchamia `mvn -B verify` na JDK 27 przy każdym pushu
@@ -578,6 +634,8 @@ Program uruchomiony bez Mavena (np. sama kompilacja w IDE) pokazuje wersję `dev
 
 ## Ograniczenia
 
+- **Graf sprzed migracji jest niepełny.** Krawędzie są zapisywane tylko dla stron odwiedzonych po migracji 3;
+  strony już odwiedzone nie są pobierane przy wznowieniu. Graf pomija linki ze stron z meta `nofollow`.
 - **`robots.txt` w uproszczonej wersji** - patrz [Uproszczenia względem RFC 9309](#uproszczenia-względem-rfc-9309).
   Strony pominięte przez `robots.txt` (także niedostępny) zostają `SKIPPED` przy wznowieniu.
 - **Tylko statyczny HTML.** jsoup nie wykonuje JavaScriptu, więc linki dodawane przez skrypty nie są widoczne.
@@ -605,4 +663,3 @@ Program uruchomiony bez Mavena (np. sama kompilacja w IDE) pokazuje wersję `dev
 - Wspólny limit tempa na host zamiast przerwy w każdym wątku.
 - Zapisywanie adresu docelowego po przekierowaniu i `rel="canonical"`, żeby wykrywać kolejne duplikaty.
 - Odczyt `sitemap.xml` jako dodatkowego źródła linków.
-- Eksport wyników (CSV, graf linków między stronami - wymagałby tabeli krawędzi).

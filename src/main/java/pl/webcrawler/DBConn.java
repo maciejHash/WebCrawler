@@ -1,5 +1,6 @@
 package pl.webcrawler;
 
+import java.nio.file.Path;
 import java.sql.Connection;
 import java.sql.DriverManager;
 import java.sql.PreparedStatement;
@@ -11,6 +12,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.TreeMap;
+import java.util.function.Consumer;
 
 /**
  * Cała obsługa bazy SQLite. Jedna instancja jest współdzielona przez wszystkie wątki,
@@ -45,6 +47,16 @@ public class DBConn implements AutoCloseable {
     private static final String ADD_RETRY_AT =
             "ALTER TABLE links ADD COLUMN retry_at INTEGER";
 
+    private static final String CREATE_EDGES = """
+            CREATE TABLE edges (
+                from_id INTEGER NOT NULL REFERENCES links(id),
+                to_id   INTEGER NOT NULL REFERENCES links(id),
+                count   INTEGER NOT NULL DEFAULT 1,
+                PRIMARY KEY (from_id, to_id)
+            ) WITHOUT ROWID""";
+    private static final String CREATE_EDGES_INDEX =
+            "CREATE INDEX idx_edges_to_id ON edges (to_id)";
+
     /**
      * Migracje schematu: element o indeksie i prowadzi bazę do wersji i + 1. Numer wersji
      * jest zapisany w pliku bazy (PRAGMA user_version, nowa baza ma 0).
@@ -55,7 +67,8 @@ public class DBConn implements AutoCloseable {
      */
     private static final List<List<String>> MIGRATIONS = List.of(
             List.of(CREATE_TABLE, CREATE_INDEX),    // 1: tabela links i indeks (status, depth)
-            List.of(ADD_ATTEMPTS, ADD_RETRY_AT)     // 2: ponawianie - kolumny attempts i retry_at
+            List.of(ADD_ATTEMPTS, ADD_RETRY_AT),    // 2: ponawianie - kolumny attempts i retry_at
+            List.of(CREATE_EDGES, CREATE_EDGES_INDEX) // 3: graf linków
     );
 
     /** Wersja schematu, do której createTables() doprowadza bazę: numer ostatniej migracji. */
@@ -76,20 +89,47 @@ public class DBConn implements AutoCloseable {
                 seen  = seen + 1,
                 depth = MIN(depth, excluded.depth)""";
 
+    // Po INSERT ... SELECT parser SQLite może uznać ON za warunek JOIN zamiast UPSERT-u.
+    // Klauzula WHERE kończy tę niejednoznaczność (bez filtra należałoby użyć WHERE true).
+    private static final String UPSERT_EDGE = """
+            INSERT INTO edges (from_id, to_id) SELECT ?, id FROM links WHERE url = ?
+            ON CONFLICT DO UPDATE SET count = count + 1""";
+
     // Adres startowy: OR IGNORE, a nie UPSERT, bo ponowne uruchomienie na tej samej bazie
     // to wznowienie pracy, a nie kolejne "znalezienie" linku - seen nie może rosnąć.
     private static final String INSERT_SEED =
             "INSERT OR IGNORE INTO links (url, depth) VALUES (?, 0)";
 
     private static final String SELECT_BY_URL = """
-            SELECT id, url, depth, seen, status, claimed_by, visited_at, error, attempts, retry_at
+            SELECT id, url, depth, seen, status, claimed_by, found_at, visited_at, error, attempts, retry_at
             FROM links WHERE url = ?""";
 
     // Przy równym seen decyduje id (kolejność znalezienia) - raport jest powtarzalny.
     private static final String SELECT_MOST_SEEN = """
-            SELECT id, url, depth, seen, status, claimed_by, visited_at, error, attempts, retry_at
+            SELECT id, url, depth, seen, status, claimed_by, found_at, visited_at, error, attempts, retry_at
             FROM links ORDER BY seen DESC, id
             LIMIT ?""";
+
+    private static final String SELECT_LINKS = """
+            SELECT id, url, depth, seen, status, claimed_by, found_at, visited_at, error, attempts, retry_at
+            FROM links ORDER BY id""";
+    private static final String SELECT_VISITED_LINKS = """
+            SELECT id, url, depth, seen, status, claimed_by, found_at, visited_at, error, attempts, retry_at
+            FROM links WHERE status = 'VISITED' ORDER BY id""";
+    private static final String SELECT_EDGES = """
+            SELECT e.from_id, e.to_id, f.url AS from_url, t.url AS to_url, e.count
+            FROM edges e JOIN links f ON f.id = e.from_id JOIN links t ON t.id = e.to_id
+            ORDER BY e.from_id, e.to_id""";
+    private static final String SELECT_VISITED_EDGES = """
+            SELECT e.from_id, e.to_id, f.url AS from_url, t.url AS to_url, e.count
+            FROM edges e JOIN links f ON f.id = e.from_id JOIN links t ON t.id = e.to_id
+            WHERE f.status = 'VISITED' AND t.status = 'VISITED'
+            ORDER BY e.from_id, e.to_id""";
+    // Para (from_id, to_id) jest unikalna, więc COUNT(*) liczy różne strony źródłowe,
+    // niezależnie od liczby wystąpień odnośnika na każdej z nich (edges.count).
+    private static final String SELECT_MOST_LINKED = """
+            SELECT t.url, COUNT(*) AS sources FROM edges e JOIN links t ON t.id = e.to_id
+            GROUP BY e.to_id ORDER BY sources DESC, e.to_id LIMIT ?""";
 
     // Strony faktycznie pobrane (VISITED i ERROR) - SKIPPED nie wymagał żądania HTTP.
     // claimed_by zostaje w wierszu po zakończeniu, więc wiadomo, który wątek go obsłużył.
@@ -169,14 +209,20 @@ public class DBConn implements AutoCloseable {
             "SELECT status, COUNT(*) AS cnt FROM links GROUP BY status";
 
     private static final String DROP_TABLE = "DROP TABLE IF EXISTS links";
+    private static final String DROP_EDGES = "DROP TABLE IF EXISTS edges";
 
     /**
      * Wiersz tabeli links w postaci potrzebnej do sprawdzania stanu bazy (m.in. w testach).
      * retryAt to Long, a nie long, bo w bazie może być NULL (ponowienia nie zaplanowano).
      */
     public record LinkRow(long id, String url, int depth, int seen, String status,
-                          String claimedBy, String visitedAt, String error, int attempts, Long retryAt) {
+                          String claimedBy, String foundAt, String visitedAt, String error,
+                          int attempts, Long retryAt) {
     }
+
+    public record EdgeRow(long fromId, long toId, String fromUrl, String toUrl, long count) { }
+
+    public record IncomingLinks(String url, long sources) { }
 
     private final String dbPath;
     private Connection connection;
@@ -188,11 +234,20 @@ public class DBConn implements AutoCloseable {
 
     /** Otwiera połączenie. Ponowne wywołanie przy otwartym połączeniu nic nie robi. */
     public synchronized void connect() {
+        connect("jdbc:sqlite:" + dbPath);
+    }
+
+    /** Tryb rw pozwala eksportować istniejącą bazę, ale nigdy nie tworzy nowego pliku. */
+    public synchronized void connectExisting() {
+        connect("jdbc:sqlite:" + Path.of(dbPath).toAbsolutePath().toUri() + "?mode=rw");
+    }
+
+    private void connect(String jdbcUrl) {
         if (connection != null) {
             return;
         }
         try {
-            connection = DriverManager.getConnection("jdbc:sqlite:" + dbPath);
+            connection = DriverManager.getConnection(jdbcUrl);
             // WAL: odczyty nie blokują zapisu. busy_timeout: przy chwilowej blokadzie pliku
             // SQLite czeka do 5 s, zamiast od razu zgłaszać błąd SQLITE_BUSY.
             execute("PRAGMA journal_mode=WAL");
@@ -296,6 +351,63 @@ public class DBConn implements AutoCloseable {
         }
     }
 
+    /** Najwyżej limit adresów z największą liczbą różnych stron linkujących. */
+    public synchronized List<IncomingLinks> findMostLinked(int limit) {
+        List<IncomingLinks> rows = new ArrayList<>();
+        try (PreparedStatement stmt = openConnection().prepareStatement(SELECT_MOST_LINKED)) {
+            stmt.setInt(1, limit);
+            try (ResultSet rs = stmt.executeQuery()) {
+                while (rs.next()) {
+                    rows.add(new IncomingLinks(rs.getString("url"), rs.getLong("sources")));
+                }
+            }
+            return rows;
+        } catch (SQLException e) {
+            throw new DatabaseException("Nie można odczytać stron z największą liczbą źródeł", e);
+        }
+    }
+
+    /** Przekazuje po jednym wierszu, bez listy całej bazy; zwraca liczbę wierszy. */
+    public synchronized long forEachLink(Consumer<LinkRow> consumer) {
+        return readLinks(SELECT_LINKS, consumer);
+    }
+
+    /** Obejmuje także odwiedzone strony bez krawędzi, potrzebne jako węzły DOT. */
+    public synchronized long forEachVisitedLink(Consumer<LinkRow> consumer) {
+        return readLinks(SELECT_VISITED_LINKS, consumer);
+    }
+
+    private long readLinks(String sql, Consumer<LinkRow> consumer) {
+        try (PreparedStatement stmt = openConnection().prepareStatement(sql);
+             ResultSet rs = stmt.executeQuery()) {
+            long count = 0;
+            while (rs.next()) {
+                consumer.accept(toLinkRow(rs));
+                count++;
+            }
+            return count;
+        } catch (SQLException e) {
+            throw new DatabaseException("Nie można odczytać linków do eksportu", e);
+        }
+    }
+
+    /** visitedOnly ogranicza oba końce krawędzi do VISITED; wynik nie jest zbierany w pamięci. */
+    public synchronized long forEachEdge(boolean visitedOnly, Consumer<EdgeRow> consumer) {
+        String sql = visitedOnly ? SELECT_VISITED_EDGES : SELECT_EDGES;
+        try (PreparedStatement stmt = openConnection().prepareStatement(sql);
+             ResultSet rs = stmt.executeQuery()) {
+            long count = 0;
+            while (rs.next()) {
+                consumer.accept(new EdgeRow(rs.getLong("from_id"), rs.getLong("to_id"),
+                        rs.getString("from_url"), rs.getString("to_url"), rs.getLong("count")));
+                count++;
+            }
+            return count;
+        } catch (SQLException e) {
+            throw new DatabaseException("Nie można odczytać krawędzi do eksportu", e);
+        }
+    }
+
     /**
      * Liczba stron pobranych przez każdy wątek (kolumna claimed_by), w kolejności
      * crawler-1, crawler-2, ... Obejmuje całą bazę, także poprzednie uruchomienia.
@@ -351,7 +463,7 @@ public class DBConn implements AutoCloseable {
 
     /**
      * Zapisuje wynik odwiedzenia strony w jednej transakcji: wszystkie znalezione linki
-     * (ten sam UPSERT co {@link #insertRow}) i status VISITED strony o podanym id.
+     * (ten sam UPSERT co {@link #insertRow}), krawędzie i status VISITED strony o podanym id.
      * Zmiany widać w bazie albo wszystkie, albo żadnej - przerwanie w połowie nie zostawi
      * strony IN_PROGRESS z częścią linków (przy wznowieniu seen rosłoby drugi raz).
      * Przy okazji jeden COMMIT zamiast osobnego zapisu na dysk dla każdego linku.
@@ -364,6 +476,7 @@ public class DBConn implements AutoCloseable {
         try {
             conn.setAutoCommit(false);
             try (PreparedStatement upsert = conn.prepareStatement(UPSERT_LINK);
+                 PreparedStatement edge = conn.prepareStatement(UPSERT_EDGE);
                  PreparedStatement visited = conn.prepareStatement(MARK_VISITED)) {
                 for (String url : links) {
                     upsert.setString(1, url);
@@ -371,6 +484,12 @@ public class DBConn implements AutoCloseable {
                     upsert.addBatch();
                 }
                 upsert.executeBatch();
+                for (String url : links) {
+                    edge.setLong(1, id);
+                    edge.setString(2, url);
+                    edge.addBatch();
+                }
+                edge.executeBatch();
                 visited.setLong(1, id);
                 visited.executeUpdate();
             }
@@ -474,14 +593,14 @@ public class DBConn implements AutoCloseable {
     }
 
     /**
-     * Usuwa tabelę (indeks znika razem z nią) i zeruje wersję schematu, żeby createTables()
+     * Usuwa tabele (indeksy znikają razem z nimi) i zeruje wersję schematu, żeby createTables()
      * wykonało wszystkie migracje od nowa. Oba kroki w jednej transakcji: gdyby program
      * przerwał się pomiędzy nimi, baza miałaby wersję 1 bez tabeli, a createTables()
      * uznałoby, że nie ma nic do zrobienia.
      */
     public synchronized void dropTables() {
         try {
-            executeInTransaction(List.of(DROP_TABLE, SET_SCHEMA_VERSION + 0));
+            executeInTransaction(List.of(DROP_EDGES, DROP_TABLE, SET_SCHEMA_VERSION + 0));
         } catch (SQLException e) {
             throw new DatabaseException("Nie można usunąć tabel", e);
         }
@@ -578,6 +697,7 @@ public class DBConn implements AutoCloseable {
                 rs.getInt("seen"),
                 rs.getString("status"),
                 rs.getString("claimed_by"),
+                rs.getString("found_at"),
                 rs.getString("visited_at"),
                 rs.getString("error"),
                 rs.getInt("attempts"),

@@ -2,16 +2,23 @@ package pl.webcrawler;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import java.time.Duration;
+import java.io.ByteArrayOutputStream;
+import java.io.PrintStream;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Path;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.stream.Stream;
 
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.io.TempDir;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.Arguments;
 import org.junit.jupiter.params.provider.CsvSource;
@@ -19,6 +26,114 @@ import org.junit.jupiter.params.provider.MethodSource;
 
 /** Parsowanie argumentów wiersza poleceń, pomoc i tekst raportu. */
 class MainTest {
+
+    @TempDir
+    Path tempDir;
+
+    @Test
+    void exportAcceptsOnlyDatabaseAndNeedsNoStartUrl() {
+        CrawlerConfig defaults = Main.parseArgs(new String[] {"--export", "wyniki"});
+        assertEquals("wyniki", defaults.exportDir());
+        assertNull(defaults.startUrl());
+        assertEquals(CrawlerConfig.DEFAULT_DB_PATH, defaults.dbPath());
+        CrawlerConfig config = Main.parseArgs(new String[] {"--db", "other.db", "--export", "wyniki"});
+        assertEquals("other.db", config.dbPath());
+        assertEquals("wyniki", config.exportDir());
+        assertEquals("other.db", Main.parseArgs(new String[] {"--export", "wyniki", "--db", "other.db"}).dbPath());
+        assertTrue(Main.usage().contains("--export KATALOG"));
+    }
+
+    @ParameterizedTest
+    @CsvSource(delimiter = '|', textBlock = """
+            --export                     | Brak wartości po --export
+            --export --db x.db           | Brak wartości po --export
+            --export out --export other  | podana więcej niż raz
+            --export out https://a.pl    | --export można łączyć tylko z --db
+            https://a.pl --export out    | --export można łączyć tylko z --db
+            --threads 1 --export out     | --export można łączyć tylko z --db
+            --export out --max-pages 1   | --export można łączyć tylko z --db
+            --export out --max-depth 0   | --export można łączyć tylko z --db
+            --export out --delay 0       | --export można łączyć tylko z --db
+            --export out --timeout 1     | --export można łączyć tylko z --db
+            --export out --retries 0     | --export można łączyć tylko z --db
+            --export out --user-agent A  | --export można łączyć tylko z --db
+            --export out --all-hosts     | --export można łączyć tylko z --db
+            --export out --fresh         | --export można łączyć tylko z --db
+            --export out --ignore-robots | --export można łączyć tylko z --db
+            --export out --foo           | Nieznana opcja
+            """)
+    void exportRejectsConflictsAndReturnsUsageExitCode(String argsLine, String message) {
+        String[] args = argsLine.split("\\s+");
+        assertTrue(assertThrows(IllegalArgumentException.class, () -> Main.parseArgs(args))
+                .getMessage().contains(message));
+        PrintStream previous = System.err;
+        try (PrintStream captured = new PrintStream(new ByteArrayOutputStream(), true, StandardCharsets.UTF_8)) {
+            System.setErr(captured);
+            assertEquals(Main.EXIT_USAGE, Main.run(args));
+        } finally {
+            System.setErr(previous);
+        }
+    }
+
+    @Test
+    void exportRejectsBlankDirectoryAlsoInConfig() {
+        assertThrows(IllegalArgumentException.class, () -> Main.parseArgs(new String[] {"--export", " "}));
+        assertThrows(IllegalArgumentException.class, () -> new CrawlerConfig(null, 1, 1, 0, true,
+                "x.db", false, 1, 0, "agent", true, 0, " "));
+    }
+
+    @Test
+    void exportCreatesFilesAndReportsPathsAndCountsWithoutCrawling() throws Exception {
+        // Spacje, polskie znaki i # sprawdzają też ścieżkę URI używaną przez connectExisting.
+        Path file = tempDir.resolve("baza żółć #1.db");
+        Path output = tempDir.resolve("out/nested");
+        long id;
+        try (DBConn db = new DBConn(file.toString())) {
+            db.connect();
+            db.createTables();
+            db.addSeed("http://127.0.0.1:1/");
+            id = db.findByUrl("http://127.0.0.1:1/").orElseThrow().id();
+            db.saveVisitedPage(id, List.of("http://127.0.0.1:1/new"), 1);
+        }
+        ByteArrayOutputStream bytes = new ByteArrayOutputStream();
+        PrintStream previous = System.out;
+        try (PrintStream captured = new PrintStream(bytes, true, StandardCharsets.UTF_8)) {
+            System.setOut(captured);
+            assertEquals(0, Main.run(new String[] {"--export", output.toString(), "--db", file.toString()}));
+        } finally {
+            System.setOut(previous);
+        }
+        String report = bytes.toString(StandardCharsets.UTF_8);
+        assertTrue(report.contains(output.resolve("links.csv") + ": 2 wierszy danych"), report);
+        assertTrue(report.contains(output.resolve("edges.csv") + ": 1 wierszy danych"), report);
+        assertTrue(report.contains(output.resolve("graph.dot") + ": 1 węzłów, 0 krawędzi"), report);
+        assertTrue(Files.readString(output.resolve("links.csv")).contains("http://127.0.0.1:1/new"));
+        assertTrue(Files.exists(output.resolve("edges.csv")));
+        assertTrue(Files.exists(output.resolve("graph.dot")));
+        try (DBConn db = new DBConn(file.toString())) {
+            db.connectExisting();
+            assertEquals(Map.of("VISITED", 1, "NEW", 1), db.countByStatus());
+            assertEquals(id, db.findByUrl("http://127.0.0.1:1/").orElseThrow().id());
+        }
+    }
+
+    @Test
+    void exportOfMissingDatabaseFailsClearlyWithoutCreatingDatabaseOrOutput() {
+        Path missing = tempDir.resolve("missing.db");
+        Path output = tempDir.resolve("out");
+        ByteArrayOutputStream bytes = new ByteArrayOutputStream();
+        PrintStream previous = System.err;
+        try (PrintStream captured = new PrintStream(bytes, true, StandardCharsets.UTF_8)) {
+            System.setErr(captured);
+            assertEquals(Main.EXIT_ERROR, Main.run(new String[] {"--db", missing.toString(),
+                    "--export", output.toString()}));
+        } finally {
+            System.setErr(previous);
+        }
+        assertTrue(bytes.toString(StandardCharsets.UTF_8).contains("plik bazy nie istnieje"));
+        assertFalse(Files.exists(missing));
+        assertFalse(Files.exists(output));
+    }
 
     @Test
     void startMessageShowsProgramAndJavaVersion() {
@@ -261,12 +376,13 @@ class MainTest {
     @Test
     void reportShowsAllSections() {
         List<DBConn.LinkRow> mostSeen = List.of(
-                new DBConn.LinkRow(2, "https://a.pl/popular", 1, 7, "VISITED", "crawler-1", null, null, 0, null),
-                new DBConn.LinkRow(1, "https://a.pl/", 0, 2, "VISITED", "crawler-2", null, null, 0, null));
+                new DBConn.LinkRow(2, "https://a.pl/popular", 1, 7, "VISITED", "crawler-1", null, null, null, 0, null),
+                new DBConn.LinkRow(1, "https://a.pl/", 0, 2, "VISITED", "crawler-2", null, null, null, 0, null));
         Map<String, Integer> byWorker = new LinkedHashMap<>();
         byWorker.put("crawler-2", 4);
         byWorker.put("crawler-10", 1);
-        Crawler.Stats stats = new Crawler.Stats(Map.of("VISITED", 3, "NEW", 5), mostSeen, byWorker,
+        Crawler.Stats stats = new Crawler.Stats(Map.of("VISITED", 3, "NEW", 5), mostSeen,
+                List.of(new DBConn.IncomingLinks("https://a.pl/target", 4)), byWorker,
                 3, Duration.ofMillis(1500), false);
 
         String text = Main.report(stats);
@@ -274,16 +390,18 @@ class MainTest {
         assertTrue(text.contains("czas trwania: 1.5 s") || text.contains("czas trwania: 1,5 s"), text);
         assertTrue(text.contains("strony pobrane w tym uruchomieniu: 3"), text);
         // Statusy bez linków też są w raporcie, z zerem.
-        assertTrue(text.matches("(?s).*VISITED\\s+3\\n.*"), text);
-        assertTrue(text.matches("(?s).*IN_PROGRESS\\s+0\\n.*"), text);
-        assertTrue(text.matches("(?s).* 1\\.\\s+7\\s+https://a\\.pl/popular\\n.*"), text);
+        assertTrue(text.matches("(?s).*VISITED\\s+3\\R.*"), text);
+        assertTrue(text.matches("(?s).*IN_PROGRESS\\s+0\\R.*"), text);
+        assertTrue(text.matches("(?s).* 1\\.\\s+7\\s+https://a\\.pl/popular\\R.*"), text);
+        assertTrue(text.contains("różnych stron linkujących"), text);
+        assertTrue(text.matches("(?s).* 1\\.\\s+4\\s+https://a\\.pl/target\\R.*"), text);
         assertTrue(text.indexOf("crawler-2") < text.indexOf("crawler-10"), "kolejność z bazy: " + text);
         assertFalse(text.contains("przerwano"), text);
     }
 
     @Test
     void reportMentionsStopAndResume() {
-        Crawler.Stats stats = new Crawler.Stats(Map.of(), List.of(), Map.of(), 0, Duration.ZERO, true);
+        Crawler.Stats stats = new Crawler.Stats(Map.of(), List.of(), List.of(), Map.of(), 0, Duration.ZERO, true);
 
         String text = Main.report(stats);
 

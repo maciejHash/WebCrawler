@@ -22,19 +22,22 @@ public class Crawler {
     static final long PROGRESS_INTERVAL_SECONDS = 5;
     /** Ile najczęściej znajdowanych linków pokazać w raporcie. */
     static final int MOST_SEEN_LIMIT = 10;
+    static final int MOST_LINKED_LIMIT = 10;
 
     /**
      * Wynik jednego uruchomienia - dane do raportu.
      *
      * @param countByStatus liczba linków w bazie w każdym statusie (cała baza, także z poprzednich uruchomień)
      * @param mostSeen      najczęściej znajdowane linki, od największego seen
+     * @param mostLinked    adresy z największą liczbą różnych stron linkujących
      * @param pagesByWorker liczba stron pobranych przez każdy wątek (cała baza)
      * @param pagesFetched  liczba żądań HTTP wykonanych w tym uruchomieniu
      * @param duration      czas od przygotowania bazy do zakończenia wszystkich wątków
      * @param stopped       czy pracę zatrzymano przed końcem (np. Ctrl+C)
      */
     public record Stats(Map<String, Integer> countByStatus, List<DBConn.LinkRow> mostSeen,
-                        Map<String, Integer> pagesByWorker, int pagesFetched, Duration duration,
+                        List<DBConn.IncomingLinks> mostLinked, Map<String, Integer> pagesByWorker,
+                        int pagesFetched, Duration duration,
                         boolean stopped) {
     }
 
@@ -99,7 +102,7 @@ public class Crawler {
                 log("zatrzymano - niedokończone linki zostają w bazie do wznowienia");
             }
             return new Stats(db.countByStatus(), db.findMostSeen(MOST_SEEN_LIMIT),
-                    db.countPagesByWorker(), pagesFetched.get(),
+                    db.findMostLinked(MOST_LINKED_LIMIT), db.countPagesByWorker(), pagesFetched.get(),
                     Duration.ofNanos(System.nanoTime() - start), stopRequested.get());
         } finally {
             db.disconnect();

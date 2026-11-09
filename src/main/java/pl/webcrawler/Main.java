@@ -1,5 +1,9 @@
 package pl.webcrawler;
 
+import java.io.IOException;
+import java.nio.file.Files;
+import java.nio.file.InvalidPathException;
+import java.nio.file.Path;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
@@ -27,7 +31,7 @@ public class Main {
 
     private static final Set<String> OPTIONS_WITH_VALUE =
             Set.of("--threads", "--max-pages", "--max-depth", "--db", "--delay", "--timeout", "--user-agent",
-                    "--retries");
+                    "--retries", "--export");
 
     /** Wydzielone z main, żeby test mógł sprawdzić treść bez przechwytywania System.out. */
     static String startMessage() {
@@ -42,6 +46,7 @@ public class Main {
     static String usage() {
         return """
                 Użycie: java -jar web-crawler.jar <startUrl> [opcje]
+                        java -jar web-crawler.jar --export KATALOG [--db plik]
 
                   <startUrl>        adres strony startowej (http lub https)
                   --threads N       liczba wątków (domyślnie %d)
@@ -62,6 +67,9 @@ public class Main {
                                     zabrania (domyślnie robots.txt jest respektowany,
                                     a meta tag robots nofollow - zawsze)
                   --db plik         plik bazy SQLite (domyślnie %s)
+                  --export KATALOG  zapisz links.csv, edges.csv i graph.dot bez crawlowania;
+                                    dozwolone tylko z --db, bez adresu startowego;
+                                    baza musi istnieć, katalog jest tworzony, pliki nadpisywane
                   --fresh           usuń dane z bazy i zacznij od nowa
                   -h, --help        wyświetl tę pomoc
                   --version         wyświetl wersję programu
@@ -74,6 +82,7 @@ public class Main {
                 Przykłady:
                   java -jar target/web-crawler.jar https://books.toscrape.com --threads 4 --max-pages 50
                   java -jar target/web-crawler.jar https://books.toscrape.com --fresh --delay 1000
+                  java -jar target/web-crawler.jar --export wyniki --db crawler.db
                   java -jar target/web-crawler.jar https://books.toscrape.com --timeout 3000 \\
                       --user-agent "MojRobot/1.0 (+https://example.com/bot)"
                 """.formatted(CrawlerConfig.DEFAULT_THREADS, CrawlerConfig.DEFAULT_MAX_PAGES,
@@ -122,6 +131,7 @@ public class Main {
         boolean fresh = CrawlerConfig.DEFAULT_FRESH;
         boolean respectRobots = CrawlerConfig.DEFAULT_RESPECT_ROBOTS;
         String dbPath = CrawlerConfig.DEFAULT_DB_PATH;
+        String exportDir = CrawlerConfig.DEFAULT_EXPORT_DIR;
 
         Set<String> usedOptions = new HashSet<>();
         for (int i = 0; i < args.length; i++) {
@@ -164,15 +174,29 @@ public class Main {
                 case "--timeout" -> timeoutMs = intValue(arg, value, 1);
                 case "--retries" -> maxRetries = intValue(arg, value, 0);
                 case "--db" -> dbPath = value;
+                case "--export" -> exportDir = value;
                 case "--user-agent" -> userAgent = value;
             }
         }
-        if (startUrl == null) {
+        if (exportDir != null) {
+            if (startUrl != null || usedOptions.stream().anyMatch(option ->
+                    !option.equals("--export") && !option.equals("--db"))) {
+                throw new IllegalArgumentException("--export można łączyć tylko z --db, bez adresu startowego");
+            }
+        } else if (startUrl == null) {
             throw new IllegalArgumentException("Brak adresu startowego");
+        }
+        try {
+            if (exportDir != null) {
+                Path.of(dbPath);
+                Path.of(exportDir);
+            }
+        } catch (InvalidPathException e) {
+            throw new IllegalArgumentException("Niepoprawna ścieżka: " + e.getInput());
         }
         // Adres i User-Agent sprawdza konstruktor CrawlerConfig.
         return new CrawlerConfig(startUrl, threads, maxPages, maxDepth, sameHostOnly, dbPath, fresh,
-                timeoutMs, delayMs, userAgent, respectRobots, maxRetries);
+                timeoutMs, delayMs, userAgent, respectRobots, maxRetries, exportDir);
     }
 
     /** Wartość opcji stojącej na pozycji optionIndex, czyli następny argument. */
@@ -205,13 +229,22 @@ public class Main {
      * {@value #EXIT_ERROR}; poprawne zakończenie (także po Ctrl+C) - kodem 0.
      */
     public static void main(String[] args) {
+        int exitCode = run(args);
+        // run kończy raport i odlicza latch przed exit, aby shutdown hook nie utknął.
+        if (exitCode != 0) {
+            System.exit(exitCode);
+        }
+    }
+
+    /** Zwraca kod wyjścia bez kończenia JVM, aby testy mogły uruchomić także tryb eksportu. */
+    static int run(String[] args) {
         if (isHelpRequested(args)) {
             System.out.print(usage());
-            return;
+            return 0;
         }
         if (isVersionRequested(args)) {
             System.out.println(versionMessage());
-            return;
+            return 0;
         }
         CrawlerConfig config;
         try {
@@ -220,8 +253,11 @@ public class Main {
             System.err.println("Błąd: " + e.getMessage());
             System.err.println();
             System.err.print(usage());
-            System.exit(EXIT_USAGE);
-            return;
+            return EXIT_USAGE;
+        }
+
+        if (config.exportDir() != null) {
+            return export(config);
         }
 
         System.out.println(startMessage());
@@ -246,10 +282,25 @@ public class Main {
         } finally {
             finished.countDown();
         }
-        // System.exit dopiero po countDown: exit uruchamia hook, a ten czekałby na
-        // wątek main, który czekałby w exit na hook - zakleszczenie.
-        if (exitCode != 0) {
-            System.exit(exitCode);
+        return exitCode;
+    }
+
+    private static int export(CrawlerConfig config) {
+        if (!Files.isRegularFile(Path.of(config.dbPath()))) {
+            System.err.println("Błąd: plik bazy nie istnieje lub nie jest zwykłym plikiem: " + config.dbPath());
+            return EXIT_ERROR;
+        }
+        try (DBConn db = new DBConn(config.dbPath())) {
+            db.connectExisting();
+            db.createTables();
+            Exporter.Result result = new Exporter(db).export(Path.of(config.exportDir()));
+            System.out.printf("%s: %d wierszy danych%n", result.linksFile(), result.links());
+            System.out.printf("%s: %d wierszy danych%n", result.edgesFile(), result.edges());
+            System.out.printf("%s: %d węzłów, %d krawędzi%n", result.graphFile(), result.nodes(), result.graphEdges());
+            return 0;
+        } catch (DatabaseException | IOException e) {
+            System.err.println("Błąd eksportu: " + e.getMessage());
+            return EXIT_ERROR;
         }
     }
 
@@ -307,6 +358,13 @@ public class Main {
         int position = 1;
         for (DBConn.LinkRow row : stats.mostSeen()) {
             text.append(String.format("    %2d. %5d  %s%n", position++, row.seen(), row.url()));
+        }
+
+        text.append("\n  ").append(Crawler.MOST_LINKED_LIMIT)
+                .append(" stron z największą liczbą różnych stron linkujących (edges, cała baza):\n");
+        position = 1;
+        for (DBConn.IncomingLinks row : stats.mostLinked()) {
+            text.append(String.format("    %2d. %5d  %s%n", position++, row.sources(), row.url()));
         }
 
         text.append("\n  Strony pobrane przez wątki (VISITED + ERROR, cała baza):\n");

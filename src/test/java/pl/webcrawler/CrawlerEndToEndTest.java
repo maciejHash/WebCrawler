@@ -174,6 +174,39 @@ class CrawlerEndToEndTest {
     }
 
     @Test
+    void edgesMatchHtmlIncludingDuplicatesCyclesSelfLinksAndSkippedTargets() {
+        Crawler.Stats stats = new Crawler(config(true)).run();
+        Map<String, Map<String, Long>> expected = Map.of(
+                base + "/", Map.of(base + "/about", 2L, base + "/blog", 2L, base + "/contact", 1L),
+                base + "/about", Map.of(base + "/", 1L, base + "/team", 1L,
+                        base + "/about", 1L, externalUrl, 1L),
+                base + "/team", Map.of(base + "/about", 1L, base + "/", 1L, base + "/missing", 1L),
+                base + "/blog", Map.of(base + "/blog/post1", 3L, base + "/blog/post2", 1L,
+                        base + "/files/report.pdf", 1L, base + "/", 1L),
+                base + "/blog/post1", Map.of(base + "/blog", 1L, base + "/blog/post2", 1L,
+                        base + "/contact", 1L),
+                base + "/blog/post2", Map.of(base + "/blog/post1", 1L, base + "/", 1L, base + "/team", 1L),
+                base + "/contact", Map.of(base + "/", 1L, base + "/files/report.pdf", 1L));
+        try (DBConn db = openDb()) {
+            Map<String, Map<String, Long>> actual = new LinkedHashMap<>();
+            assertEquals(22, db.forEachEdge(false, edge -> actual
+                    .computeIfAbsent(edge.fromUrl(), url -> new LinkedHashMap<>())
+                    .put(edge.toUrl(), edge.count())));
+            assertEquals(expected, actual);
+            assertEquals(new DBConn.IncomingLinks(base + "/", 5), stats.mostLinked().getFirst());
+        }
+        // Wznowienie nie pobiera stron drugi raz ani nie podwaja count.
+        new Crawler(config(true)).run();
+        try (DBConn db = openDb()) {
+            Map<String, Map<String, Long>> actual = new LinkedHashMap<>();
+            db.forEachEdge(false, edge -> actual.computeIfAbsent(edge.fromUrl(), url -> new LinkedHashMap<>())
+                    .put(edge.toUrl(), edge.count()));
+            assertEquals(expected, actual);
+        }
+        site.keySet().forEach(path -> assertEquals(1, requests.get(path).get(), path));
+    }
+
+    @Test
     void crawlsWholeSiteOnceAndRecordsEveryLink() {
         String dbPath = tempDir.resolve("crawl.db").toString();
         CrawlerConfig config = new CrawlerConfig(base + "/", THREADS, 100, 10, true,

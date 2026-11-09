@@ -18,10 +18,12 @@ package pl.webcrawler;
  * @param respectRobots czy pobierać robots.txt każdego hosta i pomijać strony, których zabrania
  * @param maxRetries   ile razy ponowić stronę po błędzie przejściowym (timeout, brak połączenia,
  *                     HTTP 429 i 5xx); 0 = bez ponawiania
+ * @param exportDir    katalog eksportu albo null, gdy uruchamiany jest robot
  */
 public record CrawlerConfig(String startUrl, int threads, int maxPages, int maxDepth,
                             boolean sameHostOnly, String dbPath, boolean fresh, int timeoutMs,
-                            int delayMs, String userAgent, boolean respectRobots, int maxRetries) {
+                            int delayMs, String userAgent, boolean respectRobots, int maxRetries,
+                            String exportDir) {
 
     public static final int DEFAULT_THREADS = 4;
     public static final int DEFAULT_MAX_PAGES = 100;
@@ -36,6 +38,15 @@ public record CrawlerConfig(String startUrl, int threads, int maxPages, int maxD
     public static final String DEFAULT_USER_AGENT = "pl.webcrawler/" + AppVersion.get() + " (student project)";
     public static final boolean DEFAULT_RESPECT_ROBOTS = true;
     public static final int DEFAULT_MAX_RETRIES = 2;
+    public static final String DEFAULT_EXPORT_DIR = null;
+
+    /** Konfiguracja crawlu bez eksportu. */
+    public CrawlerConfig(String startUrl, int threads, int maxPages, int maxDepth,
+                         boolean sameHostOnly, String dbPath, boolean fresh, int timeoutMs,
+                         int delayMs, String userAgent, boolean respectRobots, int maxRetries) {
+        this(startUrl, threads, maxPages, maxDepth, sameHostOnly, dbPath, fresh, timeoutMs,
+                delayMs, userAgent, respectRobots, maxRetries, DEFAULT_EXPORT_DIR);
+    }
     /**
      * Górny limit Crawl-delay z robots.txt. Plik pisze właściciel serwera, nie użytkownik - wartość
      * typu "Crawl-delay: 3600" zatrzymałaby wątek na godzinę po każdej stronie i opóźniła Ctrl+C.
@@ -49,12 +60,20 @@ public record CrawlerConfig(String startUrl, int threads, int maxPages, int maxD
      * każdy inny link, żeby trafił do bazy w tej samej postaci.
      */
     public CrawlerConfig {
-        if (startUrl == null) {
+        if (exportDir != null && exportDir.isBlank()) {
+            throw new IllegalArgumentException("Brak katalogu eksportu");
+        }
+        if (exportDir != null && startUrl != null) {
+            throw new IllegalArgumentException("--export nie można łączyć z adresem startowym");
+        }
+        if (exportDir == null && startUrl == null) {
             throw new IllegalArgumentException("Brak adresu startowego");
         }
-        String original = startUrl;
-        startUrl = UrlUtils.normalize(startUrl).orElseThrow(() ->
-                new IllegalArgumentException("Niepoprawny adres startowy (wymagany http/https): " + original));
+        if (startUrl != null) {
+            String original = startUrl;
+            startUrl = UrlUtils.normalize(startUrl).orElseThrow(() ->
+                    new IllegalArgumentException("Niepoprawny adres startowy (wymagany http/https): " + original));
+        }
         requireAtLeast("threads", threads, 1);
         requireAtLeast("maxPages", maxPages, 1);
         requireAtLeast("maxDepth", maxDepth, 0);
