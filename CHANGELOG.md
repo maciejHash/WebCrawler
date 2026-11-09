@@ -8,6 +8,9 @@ zmiany jeszcze niewydane są w sekcji „Niewydane”.
 
 ### Dodane
 
+- Automatyczny GitHub Release po wysłaniu tagu `v*`: po udanym buildzie workflow sprawdza zgodność
+  wersji w `pom.xml` z tagiem, pobiera opis danej wersji z `CHANGELOG.md` i dołącza `web-crawler.jar`.
+  Niezgodna wersja, brak opisu albo pusta sekcja zatrzymują publikację z komunikatem błędu.
 - Graf linków: migracja schematu 3 dodaje tabelę `edges` i indeks na `to_id`. Krawędzie, ich liczniki
   wystąpień (także duplikaty i linki strony do samej siebie) oraz status `VISITED` są zapisywane w tej
   samej transakcji co znalezione linki. Krawędzie powstają tylko dla stron odwiedzonych po migracji.

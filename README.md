@@ -613,7 +613,8 @@ lokalny `com.sun.net.httpserver.HttpServer` z JDK.
 | `AppVersionTest` | Wersja z przefiltrowanego zasobu; `dev`, gdy pliku brak albo nie był filtrowany. |
 
 GitHub Actions (`.github/workflows/ci.yml`) uruchamia `mvn -B verify` na JDK 27 przy każdym pushu
-do `main` i każdym pull requeście, a gotowy `web-crawler.jar` zapisuje jako artefakt.
+do `main`, każdym pull requeście i pushu tagu `v*`, a gotowy `web-crawler.jar` zapisuje jako artefakt
+`web-crawler`. Job `release` działa tylko dla tagów `v*`, po pomyślnym zakończeniu joba `build`.
 
 ## Wersje i wydania
 
@@ -626,11 +627,108 @@ Program uruchomiony bez Mavena (np. sama kompilacja w IDE) pokazuje wersję `dev
 - Numeracja według [Semantic Versioning](https://semver.org/lang/pl/): `MAJOR.MINOR.PATCH`.
   MAJOR - zmiany niezgodne wstecz (np. opcje wiersza poleceń, schemat bazy bez migracji),
   MINOR - nowe funkcje zgodne wstecz, PATCH - poprawki błędów.
-  W trakcie prac wersja ma przyrostek `-SNAPSHOT` (np. `1.1.0-SNAPSHOT`).
-- Wydanie: ustaw w `pom.xml` wersję bez `-SNAPSHOT`, opisz zmiany w `CHANGELOG.md`,
-  zrób commit i oznacz go tagiem `vX.Y.Z` (np. `git tag v1.1.0`), a potem przestaw `pom.xml`
-  na kolejną wersję `-SNAPSHOT`.
+  W trakcie prac wersja ma postać `X.Y.Z-SNAPSHOT`.
 - `CHANGELOG.md` zawiera listę zmian dla każdego wydania, od najnowszego.
+
+### Codzienna praca z repozytorium
+
+Przed rozpoczęciem kolejnej zmiany, w czystym katalogu roboczym:
+
+```bash
+git status
+git switch main
+git pull --ff-only origin main
+```
+
+Po skończeniu jednej spójnej zmiany uzupełnij sekcję `[Niewydane]` w `CHANGELOG.md`
+i odpowiednie fragmenty README, a następnie wykonaj:
+
+```bash
+mvn -q verify
+git diff --check
+git status
+git diff
+git add -- plik1 plik2
+git diff --cached
+git commit -m "Adding opis zmiany po angielsku"
+git push origin main
+git status
+```
+
+`plik1 plik2` zastąp rzeczywistymi ścieżkami plików należących do zmiany; dodaj także nowe pliki,
+bo zwykłe `git diff` ich nie pokazuje. Treść commita dobierz do zakresu: `Adding ...`, `Fixing ...`
+albo `Changing ...`. Wykonuj polecenia po kolei i kontynuuj tylko po powodzeniu poprzedniego.
+Po pushu sprawdź zielony wynik CI w zakładce **Actions**. Zwykła zmiana pozostaje przy wersji
+`-SNAPSHOT`; tag tworzysz dopiero przy wydaniu. Jeśli `pull --ff-only` lub push zostanie odrzucony,
+sprawdź rozbieżność historii przed dalszą pracą.
+
+### Przygotowanie i publikacja wydania
+
+Poniżej `X.Y.Z` oznacza numer wydania - zastąp go taką samą wartością we wszystkich poleceniach.
+
+1. Zacznij od czystego, aktualnego `main` (polecenia z poprzedniej sekcji).
+2. Ręcznie ustaw `<version>` w `pom.xml` na `X.Y.Z`, bez `-SNAPSHOT`.
+3. Przenieś gotowe wpisy z `[Niewydane]` do nowej sekcji `## [X.Y.Z] - RRRR-MM-DD` w `CHANGELOG.md`.
+   Zostaw sekcję `[Niewydane]` na przyszłe zmiany i uaktualnij odnośniki porównania na końcu pliku.
+4. Sprawdź i zapisz przygotowanie wydania:
+
+   ```bash
+   mvn -q verify
+   java -jar target/web-crawler.jar --version
+   git diff --check
+   git diff -- pom.xml CHANGELOG.md
+   git add -- pom.xml CHANGELOG.md
+   git diff --cached
+   git commit -m "Changing project version for release X.Y.Z"
+   git push origin main
+   ```
+
+5. Po zielonym CI utwórz tag z opisem na tym commicie i wyślij go:
+
+   ```bash
+   git status
+   git tag -a vX.Y.Z -m "Web Crawler X.Y.Z"
+   git show vX.Y.Z
+   git push origin vX.Y.Z
+   ```
+
+   Release tworzy się automatycznie po `git push origin vX.Y.Z`. Workflow ponownie wykonuje build
+   i testy dla oznaczonego commita. Job `release` pobiera jego JAR, sprawdza równość wersji z POM-a
+   i tagu bez początkowego `v`, wycina treść sekcji `[X.Y.Z]` z changeloga i publikuje ją jako opis
+   GitHub Release z załącznikiem `web-crawler.jar`. Brak sekcji lub pusta treść także powodują błąd.
+   Używa wyłącznie akcji `actions/*` i `gh release create`; wbudowany token otrzymuje
+   `contents: write` tylko w jobie `release`. Nie trzeba dodawać własnego sekretu z tokenem.
+   Flagi `--verify-tag` i `--notes-file` opisuje [dokumentacja GitHub CLI](https://cli.github.com/manual/gh_release_create).
+6. Po udanym wydaniu ręcznie ustaw w `pom.xml` następną wersję `X.Y.Z-SNAPSHOT`
+   (`X.Y.Z` oznacza tutaj już następny planowany numer), a następnie:
+
+   ```bash
+   mvn -q verify
+   git diff --check
+   git diff -- pom.xml
+   git add -- pom.xml
+   git diff --cached
+   git commit -m "Changing project version for next development cycle"
+   git push origin main
+   git status
+   ```
+
+   Tag nadal wskazuje commit wydania, a `main` wraca do wersji rozwojowej.
+
+### Co sprawdzić przy pierwszym automatycznym wydaniu
+
+- W **Actions**: push do `main` i pull request wykonują build, a job `release` jest pominięty;
+  push tagu `vX.Y.Z` uruchamia najpierw `build`, potem `release`. Zwykłe tagi bez `v` nie uruchamiają CI.
+- Pobranie artefaktu `web-crawler` kończy się powodzeniem. Nieudany build blokuje publikację;
+  niezgodna wersja w POM-ie, brak sekcji changeloga lub pusta sekcja kończą job czytelnym błędem.
+  Te przypadki błędne można sprawdzić osobno w kopii repozytorium.
+- W **Releases**: tytuł `Web Crawler X.Y.Z`, właściwy tag i commit, opis zawierający tylko treść
+  tej wersji (z polskimi znakami), bez `[Niewydane]`, sąsiednich wersji i definicji odnośników.
+- W załącznikach jest `web-crawler.jar`. Pobierz go i sprawdź `java -jar web-crawler.jar --version`
+  oraz `java -jar web-crawler.jar --help`; wersja musi zgadzać się z tagiem.
+- Jeśli publikacja zwróci błąd uprawnień, sprawdź polityki GitHub Actions repozytorium/organizacji
+  i możliwość przyznania wbudowanemu tokenowi `contents: write`. Nie publikuj wydania ręcznie,
+  zanim nie ustalisz przyczyny błędu workflow.
 
 ## Ograniczenia
 

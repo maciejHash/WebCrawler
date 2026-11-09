@@ -1,12 +1,16 @@
-# Buduje projekt i uruchamia wszystkie testy przy każdym pushu i pull requeście.
+# Buduje i testuje projekt; po wysłaniu tagu v* publikuje wydanie z JAR-em.
 # Testy nie łączą się z internetem (lokalny HttpServer z JDK), więc działają w CI.
 name: CI
 
 on:
   push:
     branches: [main]
+    tags: ['v*']
   pull_request:
   workflow_dispatch:
+
+permissions:
+  contents: read
 
 jobs:
   build:
@@ -30,3 +34,57 @@ jobs:
         with:
           name: web-crawler
           path: target/web-crawler.jar
+          if-no-files-found: error
+
+  release:
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    # Tylko publikacja wydania wymaga prawa zapisu do repozytorium.
+    permissions:
+      contents: write
+    env:
+      RELEASE_TAG: ${{ github.ref_name }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Pobranie JAR-a z joba build
+        uses: actions/download-artifact@v4
+        with:
+          name: web-crawler
+          path: release-artifact
+
+      - name: Sprawdzenie wersji i przygotowanie opisu wydania
+        shell: pwsh
+        run: |
+          [xml]$pom = Get-Content -LiteralPath pom.xml -Raw -Encoding utf8
+          $version = ([string]$pom.project.version).Trim()
+          $tagVersion = $env:RELEASE_TAG.Substring(1)
+          if ($version -cne $tagVersion) {
+            throw "Wersja w pom.xml ('$version') nie zgadza się z tagiem '$env:RELEASE_TAG' (oczekiwano '$tagVersion')."
+          }
+
+          $changelog = [string](Get-Content -LiteralPath CHANGELOG.md -Raw -Encoding utf8)
+          $heading = [regex]::Escape("## [$version]")
+          # Kończymy na następnej wersji albo definicjach odnośników na końcu pliku.
+          $pattern = "(?ms)^$heading(?:[ \t]+[^\r\n]*)?\r?\n(.*?)(?=^## |^\[[^\]\r\n]+\]:[ \t]|\z)"
+          $section = [regex]::Match($changelog, $pattern)
+          if (-not $section.Success) {
+            throw "Brak sekcji '## [$version]' w CHANGELOG.md dla tagu '$env:RELEASE_TAG'."
+          }
+          $notes = $section.Groups[1].Value.Trim()
+          if ([string]::IsNullOrWhiteSpace($notes)) {
+            throw "Sekcja '## [$version]' w CHANGELOG.md jest pusta. Uzupełnij opis wydania."
+          }
+          [System.IO.File]::WriteAllText("release-notes.md", $notes + "`n", [System.Text.UTF8Encoding]::new($false))
+
+      - name: Publikacja GitHub Release z JAR-em
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$RELEASE_TAG" release-artifact/web-crawler.jar \
+            --repo "$GITHUB_REPOSITORY" \
+            --verify-tag \
+            --title "Web Crawler ${RELEASE_TAG#v}" \
+            --notes-file release-notes.md
